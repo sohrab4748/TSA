@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.tsa_a_to_m import router as tsa_router
+from app.analysis_run import router as run_router
 
 app = FastAPI(title="TSA Dashboard API (A–M)", version="0.1.0")
 

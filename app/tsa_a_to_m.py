@@ -35,9 +35,21 @@ from fastapi import Body, Query, HTTPException
 import json
 from pydantic import BaseModel
 
-# You already have SeriesIn and ApiOut in your project (based on your OpenAPI).
+from __future__ import annotations
+
+from typing import Any
+
+class SeriesIn(BaseModel):
+    dates: list[str]
+    values: list[float]
+
 class SummaryIn(BaseModel):
     series: SeriesIn
+    params: dict[str, Any] = {}
+
+# Pydantic v2: ensure forward refs are resolved (safe even if not needed)
+SummaryIn.model_rebuild()
+
 
 @router.post("/tsa/B_summary", response_model=ApiOut)
 def tsa_b_summary(

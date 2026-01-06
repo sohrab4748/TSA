@@ -30,6 +30,45 @@ router = APIRouter()
 # ---------------------------
 # Helpers
 # ---------------------------
+from typing import Optional
+from fastapi import Body, Query, HTTPException
+import json
+from pydantic import BaseModel
+
+# You already have SeriesIn and ApiOut in your project (based on your OpenAPI).
+class SummaryIn(BaseModel):
+    series: SeriesIn
+
+@router.post("/tsa/B_summary", response_model=ApiOut)
+def tsa_b_summary(
+    req: Optional[SummaryIn] = Body(None),
+    payload: Optional[str] = Query(None),
+):
+    # Preferred: JSON body
+    if req is None:
+        # Backward compatible: allow ?payload=<json>
+        if payload is None:
+            raise HTTPException(status_code=422, detail="Provide JSON body or ?payload=<json>")
+
+        try:
+            req = SummaryIn(**json.loads(payload))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid payload JSON: {e}")
+
+    y = req.series.values
+    if not y:
+        return {"ok": False, "result": {"error": "Empty series"}, "warnings": []}
+
+    return {
+        "ok": True,
+        "result": {
+            "n": len(y),
+            "min": float(min(y)),
+            "max": float(max(y)),
+            "mean": float(sum(y) / len(y)),
+        },
+        "warnings": []
+    }
 
 def _prep_series(series_in) -> Tuple[pd.Series, List[str], Optional[str]]:
     warnings: List[str] = []

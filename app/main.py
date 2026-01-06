@@ -5,6 +5,14 @@ from app.analysis_run import router as run_router
 
 app = FastAPI(title="TSA Dashboard API (A–M)", version="0.1.0")
 
+@app.get("/routes")
+def routes():
+    out = []
+    for r in app.routes:
+        if hasattr(r, "methods"):
+            out.append({"path": r.path, "methods": sorted(list(r.methods))})
+    return sorted(out, key=lambda x: x["path"])
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://tsa.agrimetsoft.com"],

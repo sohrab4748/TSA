@@ -6,7 +6,7 @@ app = FastAPI(title="TSA Dashboard API (A–M)", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://tsa.agrimetsoft.com"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -403,8 +403,17 @@ def tsa_g_autocorr(payload: AutocorrIn):
     y, warnings, _freq = _prep_series(payload.series)
     try:
         y2 = y.dropna()
-        nlags = int(max(1, payload.nlags))
-        nlags = min(nlags, max(1, len(y2) - 2))
+        n = len(y2)
+
+nlags_req = int(max(1, payload.nlags))
+nlags = min(nlags_req, max(1, n - 2))
+
+# PACF constraint: must be < 50% of sample size (statsmodels requirement)
+nlags_pacf_max = max(1, (n // 2) - 1)
+if nlags > nlags_pacf_max:
+    warnings.append(f"nlags reduced from {nlags} to {nlags_pacf_max} (PACF requires nlags < n/2).")
+    nlags = nlags_pacf_max
+
 
         ac = acf(y2.values, nlags=nlags, fft=True)
         pc = pacf(y2.values, nlags=nlags, method="ywm")

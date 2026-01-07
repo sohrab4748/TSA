@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
@@ -30,13 +29,30 @@ router = APIRouter()
 # ---------------------------
 # Helpers
 # ---------------------------
+from typing import Optional
+from fastapi import Body, Query, HTTPException
+import json
+from pydantic import BaseModel
+
+
+from typing import Any
+
+class SeriesIn(BaseModel):
+    dates: list[str]
+    values: list[float]
+
+class SummaryIn(BaseModel):
+    series: SeriesIn
+    params: dict[str, Any] = {}
+
+
 
 def _prep_series(series_in) -> Tuple[pd.Series, List[str], Optional[str]]:
     warnings: List[str] = []
     y = to_series(series_in.dates, series_in.values)
 
     # use provided freq if any; otherwise infer
-    freq = series_in.freq
+    freq = getattr(series_in, 'freq', None)
     if freq is None:
         freq = infer_freq_safe(y.index)
 
@@ -176,34 +192,23 @@ def tsa_a_preprocess(payload: PreprocessIn):
 # B) Summary stats
 # ---------------------------
 
-class SeriesIn(BaseModel):
-    dates: list[str]
-    values: list[float]
-    freq: Optional[str] = None
-
-class SummaryIn(BaseModel):
-    series: "SeriesIn"
-    params: Dict[str, Any] = {}
-
-# Resolve forward refs under `from __future__ import annotations`
-SummaryIn.model_rebuild(_types_namespace={"SeriesIn": SeriesIn})
-
 @router.post("/tsa/B_summary", response_model=ApiOut)
 def tsa_b_summary(
     req: Optional[SummaryIn] = Body(None),
     payload: Optional[str] = Query(None),
 ):
-    """Summary statistics for a single time series.
+    """
+    Summary statistics.
 
     Accepts either:
-    1) JSON body: {"series": {"dates": [...], "values": [...]}, "params": {...}}
-    2) Backward-compatible query: ?payload=<json-string>
+      - JSON body: { "series": { "dates": [...], "values": [...] }, "params": {...} }
+      - Query payload: ?payload=<json string>  (backward compatible)
     """
     if req is None:
         if payload is None:
             raise HTTPException(status_code=422, detail="Provide JSON body or ?payload=<json>")
         try:
-            req = SummaryIn.model_validate_json(payload)
+            req = SummaryIn(**json.loads(payload))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid payload JSON: {e}")
 
@@ -214,7 +219,6 @@ def tsa_b_summary(
         return ApiOut(ok=False, result={"error": "All values are missing."}, warnings=warnings)
 
     desc = y2.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).to_dict()
-
     result = {
         "n": int(len(y)),
         "n_valid": int(len(y2)),
@@ -228,10 +232,8 @@ def tsa_b_summary(
         "p50": safe_float(desc.get("50%")),
         "p75": safe_float(desc.get("75%")),
         "p95": safe_float(desc.get("95%")),
-        "series": to_jsonable_series(y),
     }
     return ApiOut(ok=True, result=result, warnings=warnings)
-
 # ---------------------------
 # C) Outliers
 # ---------------------------

@@ -3,6 +3,9 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter
+import numpy as np
+import pywt
+from scipy.signal import detrend as sp_detrend
 
 from scipy import signal
 from scipy.stats import zscore
@@ -149,6 +152,17 @@ def _fit_arima_grid(y: pd.Series, seasonal_period: int, seasonal: bool,
         best_sorder = (0, 0, 0, 0)
 
     return best_order, best_sorder, warnings
+class WaveletIn(BaseModel):
+    series: SeriesIn
+    params: dict[str, Any] = {}
+    # optional duplicates (UI may send these at root if you mirror params)
+    wavelet: str | None = None
+    min_period: float | None = None
+    max_period: float | None = None
+    num_scales: int | None = None
+    detrend: bool | None = None
+    normalize: bool | None = None
+    max_time_points: int | None = None
 
 def _forecast_index(y: pd.Series, h: int) -> List[Any]:
     if isinstance(y.index, pd.DatetimeIndex):
@@ -234,6 +248,105 @@ def tsa_b_summary(
         "p95": safe_float(desc.get("95%")),
     }
     return ApiOut(ok=True, result=result, warnings=warnings)
+    
+@router.post("/tsa/N_wavelet_cwt", response_model=ApiOut)
+def tsa_n_wavelet_cwt(payload: WaveletIn):
+    y, warnings, _freq = _prep_series(payload.series)
+    y2 = y.dropna()
+
+    n = int(len(y2))
+    if n < 8:
+        return ApiOut(ok=False, result={"error": "Wavelet needs at least ~8 points."}, warnings=warnings)
+
+    # helper to read param from root OR payload.params
+    def P(name, default):
+        v = getattr(payload, name, None)
+        if v is not None:
+            return v
+        if isinstance(payload.params, dict) and name in payload.params:
+            return payload.params.get(name)
+        return default
+
+    wavelet = str(P("wavelet", "morl"))
+    min_period = float(P("min_period", 2.0))
+    max_period = P("max_period", None)
+    max_period = float(max_period) if max_period not in (None, "", 0) else float(max(4.0, n / 2))
+    num_scales = int(P("num_scales", 64))
+    do_detrend = bool(P("detrend", True))
+    normalize = bool(P("normalize", True))
+    max_time_points = int(P("max_time_points", 500))
+
+    # estimate dt (in days) from datetime index; fallback to 1
+    dt = 1.0
+    try:
+        idx = y2.index
+        if len(idx) >= 2:
+            d = np.diff(idx.values.astype("datetime64[ns]"))
+            dt_days = np.median(d) / np.timedelta64(1, "D")
+            if np.isfinite(dt_days) and dt_days > 0:
+                dt = float(dt_days)
+    except Exception:
+        pass
+
+    # prepare values
+    vals = y2.values.astype(float)
+    if do_detrend:
+        vals = sp_detrend(vals, type="linear")
+    else:
+        vals = vals - np.nanmean(vals)
+
+    if normalize:
+        s = np.nanstd(vals)
+        if np.isfinite(s) and s > 0:
+            vals = vals / s
+
+    # choose periods (log-spaced)
+    max_period = max(max_period, min_period * 1.01)
+    num_scales = max(8, min(num_scales, 256))
+    periods = np.geomspace(min_period, max_period, num_scales)
+
+    # scales -> use central frequency
+    try:
+        cf = pywt.central_frequency(wavelet)
+    except Exception:
+        cf = pywt.central_frequency("morl")
+        warnings.append(f"Unknown wavelet '{wavelet}', using 'morl' instead.")
+        wavelet = "morl"
+
+    scales = (periods * cf) / dt
+
+    # compute CWT
+    coef, freqs = pywt.cwt(vals, scales, wavelet, sampling_period=dt)
+    power = np.abs(coef) ** 2
+
+    # periods implied by returned freqs (safer)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        periods_out = np.where(freqs > 0, 1.0 / freqs, np.nan)
+
+    # downsample time if large
+    x = y2.index.astype(str).tolist()
+    if n > max_time_points:
+        keep = np.linspace(0, n - 1, max_time_points).astype(int)
+        x = [x[i] for i in keep]
+        power = power[:, keep]
+
+    # global wavelet spectrum
+    gws = np.nanmean(power, axis=1)
+
+    result = {
+        "wavelet": wavelet,
+        "dt_days": dt,
+        "n": int(n),
+        "time": x,
+        "periods": [safe_float(p) for p in periods_out.tolist()],
+        "power": power.tolist(),             # shape: [n_scales][n_time]
+        "global_spectrum": [safe_float(v) for v in gws.tolist()],
+        "notes": {
+            "suggest_plot": "Use log10(1+power) for heatmap; periods are in time-steps (days if dt=1 day)."
+        }
+    }
+    return ApiOut(ok=True, result=result, warnings=warnings)
+
 # ---------------------------
 # C) Outliers
 # ---------------------------

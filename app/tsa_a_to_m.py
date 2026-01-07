@@ -401,40 +401,60 @@ def tsa_f_stationarity(payload: StationarityIn):
 @router.post("/tsa/G_autocorr", response_model=ApiOut)
 def tsa_g_autocorr(payload: AutocorrIn):
     y, warnings, _freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    n = int(len(y2))
+
+    if n < 3:
+        return ApiOut(ok=False, result={"error": "Need at least 3 observations for ACF/PACF."}, warnings=warnings)
+
+    # Accept nlags either as payload.nlags OR payload.params["nlags"]
+    nlags_in = getattr(payload, "nlags", None)
+    if nlags_in is None and hasattr(payload, "params") and isinstance(payload.params, dict):
+        nlags_in = payload.params.get("nlags", None)
+
+    nlags_req = int(max(1, nlags_in or 1))
+
+    # ACF can go up to n-2 (safe), PACF has stricter constraint (< n/2 for common methods)
+    nlags = min(nlags_req, max(1, n - 2))
+
+    nlags_pacf_max = max(1, (n // 2) - 1)  # ensures nlags < n/2
+    if nlags > nlags_pacf_max:
+        warnings.append(f"nlags reduced from {nlags} to {nlags_pacf_max} (PACF requires nlags < n/2).")
+        nlags = nlags_pacf_max
+
     try:
-        y2 = y.dropna()
-        n = len(y2)
-
-nlags_req = int(max(1, payload.nlags))
-nlags = min(nlags_req, max(1, n - 2))
-
-# PACF constraint: must be < 50% of sample size (statsmodels requirement)
-nlags_pacf_max = max(1, (n // 2) - 1)
-if nlags > nlags_pacf_max:
-    warnings.append(f"nlags reduced from {nlags} to {nlags_pacf_max} (PACF requires nlags < n/2).")
-    nlags = nlags_pacf_max
-
-
         ac = acf(y2.values, nlags=nlags, fft=True)
         pc = pacf(y2.values, nlags=nlags, method="ywm")
 
-        # Ljung-Box
+        # optional Ljung-Box
+        lj = []
         try:
-            lb = acorr_ljungbox(y2.values, lags=[min(10, nlags), min(20, nlags)], return_df=True)
-            lj = [{"lag": int(i), "stat": float(r["lb_stat"]), "pvalue": float(r["lb_pvalue"])} for i, r in lb.iterrows()]
+            lags = sorted(set([min(10, nlags), min(20, nlags)]))
+            lb = acorr_ljungbox(y2.values, lags=lags, return_df=True)
+            for idx, row in lb.iterrows():
+                lj.append({
+                    "lag": int(idx),
+                    "stat": safe_float(row.get("lb_stat")),
+                    "pvalue": safe_float(row.get("lb_pvalue")),
+                })
         except Exception:
-            lj = []
+            pass
 
-        return ApiOut(ok=True, result={
-            "nlags": int(nlags),
-            "acf": _as_float_list(ac),
-            "pacf": _as_float_list(pc),
-            "ljung_box": lj,
-        }, warnings=warnings)
+        return ApiOut(
+            ok=True,
+            result={
+                "nlags": int(nlags),
+                "acf": _as_float_list(ac),
+                "pacf": _as_float_list(pc),
+                "ljung_box": lj,
+            },
+            warnings=warnings,
+        )
 
     except Exception as e:
-        warnings.append(f"G_autocorr failed: {e}")
+        warnings.append(f"G_autocorr failed: {str(e)}")
         return ApiOut(ok=False, result={"error": str(e)}, warnings=warnings)
+
 
 
 # ---------------------------

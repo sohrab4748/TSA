@@ -550,42 +550,113 @@ def tsa_j_arima(payload: ForecastIn):
 # K) ETS (Holt-Winters) forecast
 # ---------------------------
 
-@router.post("/tsa/K_ets_forecast", response_model=ApiOut)
-def tsa_k_ets(payload: ETSIn):
+import numpy as np
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+@router.post("/tsa/J_arima_forecast", response_model=ApiOut)
+def tsa_j_arima(payload: ForecastIn):
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
+    n = int(y2.shape[0])
     h = int(max(1, payload.horizon))
+
+    # seasonal period inferred / provided
     sp = _seasonal_period_from_inputs(freq, payload.seasonal_period)
 
-    if len(y2) < max(10, 2 * sp):
-        warnings.append("Short series for ETS with seasonality; consider disabling seasonal.")
+    # --- Safety rules for short series (prevents unstable models) ---
+    # With very short series, auto-ARIMA can easily pick unstable AR terms.
+    # Restrict the search hard and (optionally) disable seasonal.
+    seasonal = bool(getattr(payload, "seasonal", False))
+    if n < 20:
+        warnings.append(f"Very short series (n={n}); restricting ARIMA search to avoid unstable fits.")
+        max_p = min(int(getattr(payload, "max_p", 1)), 1)
+        max_d = min(int(getattr(payload, "max_d", 1)), 1)
+        max_q = min(int(getattr(payload, "max_q", 1)), 1)
+        max_P = max_D = max_Q = 0
+        seasonal = False
+        sp = 0
+    else:
+        max_p = int(getattr(payload, "max_p", 3))
+        max_d = int(getattr(payload, "max_d", 1))
+        max_q = int(getattr(payload, "max_q", 3))
+        max_P = int(getattr(payload, "max_P", 1))
+        max_D = int(getattr(payload, "max_D", 1))
+        max_Q = int(getattr(payload, "max_Q", 1))
 
-    trend = None if payload.trend == "none" else payload.trend
-    seasonal = None if payload.seasonal == "none" else payload.seasonal
+    # seasonal_order must be (P,D,Q,s) with s>=2 to matter
+    def normalize_sorder(sorder):
+        P, D, Q, s = sorder
+        if (not seasonal) or (s is None) or (int(s) < 2) or (P == 0 and D == 0 and Q == 0):
+            return (0, 0, 0, 0)
+        return (int(P), int(D), int(Q), int(s))
+
+    # --- Choose order / seasonal_order ---
+    if getattr(payload, "auto", True):
+        order, sorder, w = _fit_arima_grid(
+            y2,
+            seasonal_period=sp,
+            seasonal=seasonal,
+            max_p=max_p, max_d=max_d, max_q=max_q,
+            max_P=max_P, max_D=max_D, max_Q=max_Q
+        )
+        warnings += w
+    else:
+        # If you later add manual order fields to ForecastIn, use them here.
+        order = (1, 0, 0)
+        sorder = (0, 0, 0, 0)
+
+    sorder = normalize_sorder(sorder)
+
+    def fit_and_forecast(ord_, sord_):
+        model = SARIMAX(
+            y2,
+            order=tuple(map(int, ord_)),
+            seasonal_order=tuple(map(int, sord_)),
+            # Key change: force stable solutions
+            enforce_stationarity=True,
+            enforce_invertibility=True
+        )
+        res = model.fit(disp=False, maxiter=200)
+        fc = res.get_forecast(steps=h)
+        mean = fc.predicted_mean
+        ci = fc.conf_int(alpha=0.05)
+        return res, mean, ci
 
     try:
-        model = ExponentialSmoothing(
-            y2,
-            trend=trend,
-            damped_trend=payload.damped_trend if trend is not None else False,
-            seasonal=seasonal,
-            seasonal_periods=sp if seasonal is not None else None
-        )
-        res = model.fit(optimized=True)
-        mean = res.forecast(h)
+        res, mean, ci = fit_and_forecast(order, sorder)
+
+        # --- Explosion guard ---
+        # If forecast magnitude explodes relative to observed scale, fall back to a safe baseline.
+        y_scale = float(np.nanmax(np.abs(y2.values))) if n > 0 else 1.0
+        y_scale = max(y_scale, 1e-9)
+        mmax = float(np.nanmax(np.abs(mean.values))) if len(mean.values) else 0.0
+
+        if (not np.isfinite(mmax)) or (mmax / y_scale > 1e6):
+            warnings.append(
+                "ARIMA forecast magnitude exploded (unstable fit). "
+                "Falling back to ARIMA(0,1,0). Provide more data or reduce max_p/max_q."
+            )
+            order = (0, 1, 0)
+            sorder = (0, 0, 0, 0)
+            res, mean, ci = fit_and_forecast(order, sorder)
 
         x_fc = _forecast_index(y2, h)
+
         result = {
-            "params": {k: (float(v) if np.isfinite(v) else None) for k, v in res.params.items() if isinstance(v, (int, float, np.floating))},
+            "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
+            "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
+            "aic": safe_float(res.aic),
             "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
-            "seasonal_period_used": int(sp) if seasonal is not None else None,
-            "trend": payload.trend,
-            "seasonal": payload.seasonal,
-            "damped_trend": payload.damped_trend,
+            "conf_int_95": {
+                "lower": _as_float_list(ci.iloc[:, 0].values),
+                "upper": _as_float_list(ci.iloc[:, 1].values),
+            },
         }
         return ApiOut(ok=True, result=result, warnings=warnings)
+
     except Exception as e:
-        return ApiOut(ok=False, result={"error": f"ETS failed: {str(e)}"}, warnings=warnings)
+        return ApiOut(ok=False, result={"error": f"ARIMA fit/forecast failed: {str(e)}"}, warnings=warnings)
+
 
 # ---------------------------
 # L) Theta forecast

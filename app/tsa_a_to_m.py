@@ -401,28 +401,32 @@ def tsa_f_stationarity(payload: StationarityIn):
 @router.post("/tsa/G_autocorr", response_model=ApiOut)
 def tsa_g_autocorr(payload: AutocorrIn):
     y, warnings, _freq = _prep_series(payload.series)
-    y2 = y.dropna()
-
-    nlags = int(max(1, payload.nlags))
-    nlags = min(nlags, max(1, len(y2) - 2))
-
-    ac = acf(y2.values, nlags=nlags, fft=True)
-    pc = pacf(y2.values, nlags=nlags, method="ywm")
-
-    # Ljung-Box
     try:
-        lb = acorr_ljungbox(y2.values, lags=[min(10, nlags), min(20, nlags)], return_df=True)
-        lj = [{"lag": int(i), "stat": float(r["lb_stat"]), "pvalue": float(r["lb_pvalue"])} for i, r in lb.iterrows()]
-    except Exception:
-        lj = []
+        y2 = y.dropna()
+        nlags = int(max(1, payload.nlags))
+        nlags = min(nlags, max(1, len(y2) - 2))
 
-    result = {
-        "nlags": int(nlags),
-        "acf": _as_float_list(ac),
-        "pacf": _as_float_list(pc),
-        "ljung_box": lj,
-    }
-    return ApiOut(ok=True, result=result, warnings=warnings)
+        ac = acf(y2.values, nlags=nlags, fft=True)
+        pc = pacf(y2.values, nlags=nlags, method="ywm")
+
+        # Ljung-Box
+        try:
+            lb = acorr_ljungbox(y2.values, lags=[min(10, nlags), min(20, nlags)], return_df=True)
+            lj = [{"lag": int(i), "stat": float(r["lb_stat"]), "pvalue": float(r["lb_pvalue"])} for i, r in lb.iterrows()]
+        except Exception:
+            lj = []
+
+        return ApiOut(ok=True, result={
+            "nlags": int(nlags),
+            "acf": _as_float_list(ac),
+            "pacf": _as_float_list(pc),
+            "ljung_box": lj,
+        }, warnings=warnings)
+
+    except Exception as e:
+        warnings.append(f"G_autocorr failed: {e}")
+        return ApiOut(ok=False, result={"error": str(e)}, warnings=warnings)
+
 
 # ---------------------------
 # H) Spectrum / Periodogram

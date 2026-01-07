@@ -30,57 +30,6 @@ router = APIRouter()
 # ---------------------------
 # Helpers
 # ---------------------------
-from typing import Optional
-from fastapi import Body, Query, HTTPException
-import json
-from pydantic import BaseModel
-
-from __future__ import annotations
-
-from typing import Any
-
-class SeriesIn(BaseModel):
-    dates: list[str]
-    values: list[float]
-
-class SummaryIn(BaseModel):
-    series: SeriesIn
-    params: dict[str, Any] = {}
-
-# Pydantic v2: ensure forward refs are resolved (safe even if not needed)
-SummaryIn.model_rebuild()
-
-
-@router.post("/tsa/B_summary", response_model=ApiOut)
-def tsa_b_summary(
-    req: Optional[SummaryIn] = Body(None),
-    payload: Optional[str] = Query(None),
-):
-    # Preferred: JSON body
-    if req is None:
-        # Backward compatible: allow ?payload=<json>
-        if payload is None:
-            raise HTTPException(status_code=422, detail="Provide JSON body or ?payload=<json>")
-
-        try:
-            req = SummaryIn(**json.loads(payload))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid payload JSON: {e}")
-
-    y = req.series.values
-    if not y:
-        return {"ok": False, "result": {"error": "Empty series"}, "warnings": []}
-
-    return {
-        "ok": True,
-        "result": {
-            "n": len(y),
-            "min": float(min(y)),
-            "max": float(max(y)),
-            "mean": float(sum(y) / len(y)),
-        },
-        "warnings": []
-    }
 
 def _prep_series(series_in) -> Tuple[pd.Series, List[str], Optional[str]]:
     warnings: List[str] = []
@@ -227,15 +176,45 @@ def tsa_a_preprocess(payload: PreprocessIn):
 # B) Summary stats
 # ---------------------------
 
+class SeriesIn(BaseModel):
+    dates: list[str]
+    values: list[float]
+    freq: Optional[str] = None
+
+class SummaryIn(BaseModel):
+    series: "SeriesIn"
+    params: Dict[str, Any] = {}
+
+# Resolve forward refs under `from __future__ import annotations`
+SummaryIn.model_rebuild(_types_namespace={"SeriesIn": SeriesIn})
+
 @router.post("/tsa/B_summary", response_model=ApiOut)
-def tsa_b_summary(payload):
-    y, warnings, freq = _prep_series(payload.series)
+def tsa_b_summary(
+    req: Optional[SummaryIn] = Body(None),
+    payload: Optional[str] = Query(None),
+):
+    """Summary statistics for a single time series.
+
+    Accepts either:
+    1) JSON body: {"series": {"dates": [...], "values": [...]}, "params": {...}}
+    2) Backward-compatible query: ?payload=<json-string>
+    """
+    if req is None:
+        if payload is None:
+            raise HTTPException(status_code=422, detail="Provide JSON body or ?payload=<json>")
+        try:
+            req = SummaryIn.model_validate_json(payload)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid payload JSON: {e}")
+
+    y, warnings, freq = _prep_series(req.series)
     y2 = y.dropna()
 
     if len(y2) == 0:
         return ApiOut(ok=False, result={"error": "All values are missing."}, warnings=warnings)
 
     desc = y2.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).to_dict()
+
     result = {
         "n": int(len(y)),
         "n_valid": int(len(y2)),

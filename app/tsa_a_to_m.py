@@ -42,7 +42,7 @@ from typing import Any
 
 class SeriesIn(BaseModel):
     dates: list[str]
-    values: list[float]
+    values: list[float | None]
 
 class SummaryIn(BaseModel):
     series: SeriesIn

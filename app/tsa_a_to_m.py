@@ -204,7 +204,7 @@ def _fit_arima_grid(
                                         enforce_stationarity=True,
                                         enforce_invertibility=True,
                                     )
-                                    res = model.fit(disp=False, maxiter=150)
+                                    res = model.fit(disp=False, maxiter=80)
                                     aic = float(res.aic) if np.isfinite(res.aic) else np.inf
                                     if aic < best_aic:
                                         best_aic = aic
@@ -243,6 +243,77 @@ def tsa_a_preprocess(payload: PreprocessIn):
         "freq_inferred": infer_freq_safe(y.index),
     }
     return ApiOut(ok=True, result=result, warnings=warnings)
+
+
+def _fit_arima_fast(
+    y: pd.Series,
+    seasonal_period: int,
+    seasonal: bool,
+    maxiter: int = 80,
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int], List[str]]:
+    """Very small candidate search for ARIMA/SARIMAX (fast)."""
+    warnings: List[str] = []
+
+    yv = pd.to_numeric(y, errors="coerce").astype("float64").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(yv) < 8:
+        warnings.append("Series too short for ARIMA; using ARIMA(0,1,0).")
+        return (0, 1, 0), (0, 0, 0, 0), warnings
+
+    seasonal_period = int(seasonal_period or 0)
+    seasonal = bool(seasonal and seasonal_period >= 2)
+
+    # A small, practical set of candidates (keeps Render / small CPUs happy)
+    base_orders = [
+        (0, 1, 0),
+        (1, 1, 0),
+        (0, 1, 1),
+        (1, 1, 1),
+        (2, 1, 1),
+        (2, 1, 0),
+        (0, 1, 2),
+    ]
+
+    # Light seasonal candidates (optional)
+    seasonal_orders = [(0, 0, 0, 0)]
+    if seasonal:
+        seasonal_orders = [
+            (0, 0, 0, 0),
+            (1, 0, 0, seasonal_period),
+            (0, 1, 1, seasonal_period),
+        ]
+
+    best_aic = np.inf
+    best_order = (0, 1, 0)
+    best_sorder = (0, 0, 0, 0)
+
+    for order in base_orders:
+        for sorder in seasonal_orders:
+            try:
+                model = SARIMAX(
+                    yv,
+                    order=order,
+                    seasonal_order=sorder,
+                    enforce_stationarity=True,
+                    enforce_invertibility=True,
+                )
+                res = model.fit(disp=False, maxiter=int(maxiter))
+                aic = float(res.aic) if np.isfinite(res.aic) else np.inf
+                if aic < best_aic:
+                    best_aic = aic
+                    best_order = tuple(int(x) for x in order)
+                    best_sorder = tuple(int(x) for x in sorder)
+            except Exception:
+                continue
+
+    if not np.isfinite(best_aic):
+        warnings.append("ARIMA candidates failed; using ARIMA(0,1,0).")
+        return (0, 1, 0), (0, 0, 0, 0), warnings
+
+    if best_sorder == (0, 0, 0, 0) and seasonal:
+        warnings.append("Seasonal ARIMA candidates did not improve AIC; using non-seasonal order.")
+
+    return best_order, best_sorder, warnings
+
 
 # ---------------------------
 # B) Summary stats
@@ -693,6 +764,12 @@ def tsa_j_arima(payload: ForecastIn):
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
     n = int(y2.shape[0])
+    # Fit on a capped window for speed (helps on small CPUs / Render)
+    y_fit = y2
+    if n > 2000:
+        warnings.append(f"Series is long (n={n}); fitting ARIMA on the last 2000 points for speed.")
+        y_fit = y2.iloc[-2000:]
+        n = int(y_fit.shape[0])
     h = int(max(1, payload.horizon))
 
     # seasonal period inferred / provided
@@ -726,32 +803,31 @@ def tsa_j_arima(payload: ForecastIn):
         return (int(P), int(D), int(Q), int(s))
 
     # --- Choose order / seasonal_order ---
-    if getattr(payload, "auto", True):
-        order, sorder, w = _fit_arima_grid(
-            y2,
-            seasonal_period=sp,
-            seasonal=seasonal,
-            max_p=max_p, max_d=max_d, max_q=max_q,
-            max_P=max_P, max_D=max_D, max_Q=max_Q
-        )
+    auto = bool(getattr(payload, "auto", True))
+    if auto:
+        # Fast candidate search (much faster than full grid search on Render/free tiers)
+        order, sorder, w = _fit_arima_fast(y_fit, sp, seasonal, maxiter=80)
         warnings += w
     else:
-        # If you later add manual order fields to ForecastIn, use them here.
-        order = (1, 0, 0)
+        # Optional manual order fields (if provided); otherwise use a sensible default.
+        p = int(getattr(payload, "p", 1))
+        d = int(getattr(payload, "d", 1))
+        q = int(getattr(payload, "q", 1))
+        order = (max(0, p), max(0, d), max(0, q))
         sorder = (0, 0, 0, 0)
 
     sorder = normalize_sorder(sorder)
 
     def fit_and_forecast(ord_, sord_):
         model = SARIMAX(
-            y2,
+            y_fit,
             order=tuple(map(int, ord_)),
             seasonal_order=tuple(map(int, sord_)),
             # Key change: force stable solutions
             enforce_stationarity=True,
             enforce_invertibility=True
         )
-        res = model.fit(disp=False, maxiter=200)
+        res = model.fit(disp=False, maxiter=80)
         fc = res.get_forecast(steps=h)
         mean = fc.predicted_mean
         ci = fc.conf_int(alpha=0.05)

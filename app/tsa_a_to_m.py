@@ -153,7 +153,12 @@ def _fit_arima_grid(
     max_p: int, max_d: int, max_q: int,
     max_P: int, max_D: int, max_Q: int
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int], List[str]]:
-    """Small AIC grid-search for SARIMAX orders (safe + bounded)."""
+    """Fast, bounded AIC search for ARIMA/SARIMA.
+
+    Notes:
+    - Render/low-CPU environments will time out if we do a large SARIMAX grid.
+    - We therefore cap the sample size, cap iterations, and try a small candidate set.
+    """
     warnings: List[str] = []
 
     yv = pd.to_numeric(y, errors="coerce").astype("float64").replace([np.inf, -np.inf], np.nan).dropna()
@@ -161,68 +166,69 @@ def _fit_arima_grid(
         warnings.append("Series too short for auto-ARIMA; using ARIMA(0,1,0).")
         return (0, 1, 0), (0, 0, 0, 0), warnings
 
+    # Speed guard: fit on the most recent window only
+    MAX_N = 2000
+    if len(yv) > MAX_N:
+        warnings.append(f"Auto-ARIMA: using last {MAX_N} points (n={len(yv)}) for speed.")
+        yv = yv.iloc[-MAX_N:]
+
+    # Prefer non-seasonal unless explicitly requested AND period is sensible
     seasonal_period = int(seasonal_period or 0)
-    use_seasonal = bool(seasonal) and seasonal_period >= 2
+    use_seasonal = bool(seasonal) and seasonal_period >= 2 and seasonal_period <= 366
 
-    p_list = range(0, max(0, int(max_p)) + 1)
-    d_list = range(0, max(0, int(max_d)) + 1)
-    q_list = range(0, max(0, int(max_q)) + 1)
+    # Candidate sets (small but practical)
+    p_cand = [0, 1, 2]
+    q_cand = [0, 1, 2]
+    d_cand = [0, 1] if int(max_d) >= 1 else [0]
 
+    # Keep seasonal search extremely small
+    seasonal_candidates = [(0, 0, 0, 0)]
     if use_seasonal:
-        P_list = range(0, max(0, int(max_P)) + 1)
-        D_list = range(0, max(0, int(max_D)) + 1)
-        Q_list = range(0, max(0, int(max_Q)) + 1)
-        s_list = [seasonal_period]
-    else:
-        P_list, D_list, Q_list, s_list = [0], [0], [0], [0]
+        seasonal_candidates.append((1, 0, 1, seasonal_period))
 
     best_aic = np.inf
     best_order = (0, 1, 0)
     best_sorder = (0, 0, 0, 0)
 
     tried = 0
-    max_tries = 120  # hard cap for safety
+    max_tries = 24  # hard cap
 
-    for p in p_list:
-        for d in d_list:
-            for q in q_list:
+    for d in d_cand:
+        for p in p_cand:
+            for q in q_cand:
                 if p == 0 and d == 0 and q == 0:
                     continue
-                for P in P_list:
-                    for D in D_list:
-                        for Q in Q_list:
-                            for s in s_list:
-                                tried += 1
-                                if tried > max_tries:
-                                    warnings.append("Auto-ARIMA grid search capped; using best found so far.")
-                                    return best_order, best_sorder, warnings
-                                try:
-                                    model = SARIMAX(
-                                        yv,
-                                        order=(int(p), int(d), int(q)),
-                                        seasonal_order=(int(P), int(D), int(Q), int(s)),
-                                        enforce_stationarity=True,
-                                        enforce_invertibility=True,
-                                    )
-                                    res = model.fit(disp=False, maxiter=80)
-                                    aic = float(res.aic) if np.isfinite(res.aic) else np.inf
-                                    if aic < best_aic:
-                                        best_aic = aic
-                                        best_order = (int(p), int(d), int(q))
-                                        best_sorder = (int(P), int(D), int(Q), int(s))
-                                except Exception:
-                                    continue
+                for sorder in seasonal_candidates:
+                    tried += 1
+                    if tried > max_tries:
+                        warnings.append("Auto-ARIMA candidate cap reached; using best found so far.")
+                        return best_order, best_sorder, warnings
+                    try:
+                        D = int(sorder[1])
+                        simple_diff = (int(d) > 0) or (D > 0)
+                        model = SARIMAX(
+                            yv,
+                            order=(int(p), int(d), int(q)),
+                            seasonal_order=tuple(map(int, sorder)),
+                            enforce_stationarity=False,
+                            enforce_invertibility=False,
+                            simple_differencing=simple_diff,
+                            low_memory=True,
+                        )
+                        res = model.fit(disp=False, maxiter=60)
+                        aic = float(res.aic) if np.isfinite(res.aic) else np.inf
+                        if aic < best_aic:
+                            best_aic = aic
+                            best_order = (int(p), int(d), int(q))
+                            best_sorder = tuple(map(int, sorder))
+                    except Exception:
+                        continue
 
     if not np.isfinite(best_aic):
-        warnings.append("Auto-ARIMA failed for all candidates; using ARIMA(0,1,0).")
+        warnings.append("Auto-ARIMA could not fit any candidate; using ARIMA(0,1,0).")
         return (0, 1, 0), (0, 0, 0, 0), warnings
 
     return best_order, best_sorder, warnings
-
-
-# ---------------------------
-# A) Preprocess / clean
-# ---------------------------
 
 @router.post("/tsa/A_preprocess", response_model=ApiOut)
 def tsa_a_preprocess(payload: PreprocessIn):
@@ -243,77 +249,6 @@ def tsa_a_preprocess(payload: PreprocessIn):
         "freq_inferred": infer_freq_safe(y.index),
     }
     return ApiOut(ok=True, result=result, warnings=warnings)
-
-
-def _fit_arima_fast(
-    y: pd.Series,
-    seasonal_period: int,
-    seasonal: bool,
-    maxiter: int = 80,
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int], List[str]]:
-    """Very small candidate search for ARIMA/SARIMAX (fast)."""
-    warnings: List[str] = []
-
-    yv = pd.to_numeric(y, errors="coerce").astype("float64").replace([np.inf, -np.inf], np.nan).dropna()
-    if len(yv) < 8:
-        warnings.append("Series too short for ARIMA; using ARIMA(0,1,0).")
-        return (0, 1, 0), (0, 0, 0, 0), warnings
-
-    seasonal_period = int(seasonal_period or 0)
-    seasonal = bool(seasonal and seasonal_period >= 2)
-
-    # A small, practical set of candidates (keeps Render / small CPUs happy)
-    base_orders = [
-        (0, 1, 0),
-        (1, 1, 0),
-        (0, 1, 1),
-        (1, 1, 1),
-        (2, 1, 1),
-        (2, 1, 0),
-        (0, 1, 2),
-    ]
-
-    # Light seasonal candidates (optional)
-    seasonal_orders = [(0, 0, 0, 0)]
-    if seasonal:
-        seasonal_orders = [
-            (0, 0, 0, 0),
-            (1, 0, 0, seasonal_period),
-            (0, 1, 1, seasonal_period),
-        ]
-
-    best_aic = np.inf
-    best_order = (0, 1, 0)
-    best_sorder = (0, 0, 0, 0)
-
-    for order in base_orders:
-        for sorder in seasonal_orders:
-            try:
-                model = SARIMAX(
-                    yv,
-                    order=order,
-                    seasonal_order=sorder,
-                    enforce_stationarity=True,
-                    enforce_invertibility=True,
-                )
-                res = model.fit(disp=False, maxiter=int(maxiter))
-                aic = float(res.aic) if np.isfinite(res.aic) else np.inf
-                if aic < best_aic:
-                    best_aic = aic
-                    best_order = tuple(int(x) for x in order)
-                    best_sorder = tuple(int(x) for x in sorder)
-            except Exception:
-                continue
-
-    if not np.isfinite(best_aic):
-        warnings.append("ARIMA candidates failed; using ARIMA(0,1,0).")
-        return (0, 1, 0), (0, 0, 0, 0), warnings
-
-    if best_sorder == (0, 0, 0, 0) and seasonal:
-        warnings.append("Seasonal ARIMA candidates did not improve AIC; using non-seasonal order.")
-
-    return best_order, best_sorder, warnings
-
 
 # ---------------------------
 # B) Summary stats
@@ -763,13 +698,11 @@ def tsa_i_xcorr(payload: XCorrIn):
 def tsa_j_arima(payload: ForecastIn):
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
+    # Speed guard: ARIMA on very long series is slow on low-CPU servers
+    if y2.shape[0] > 2000:
+        warnings.append(f"ARIMA: input series is long (n={int(y2.shape[0])}); fitting on last 2000 points for speed.")
+        y2 = y2.iloc[-2000:]
     n = int(y2.shape[0])
-    # Fit on a capped window for speed (helps on small CPUs / Render)
-    y_fit = y2
-    if n > 2000:
-        warnings.append(f"Series is long (n={n}); fitting ARIMA on the last 2000 points for speed.")
-        y_fit = y2.iloc[-2000:]
-        n = int(y_fit.shape[0])
     h = int(max(1, payload.horizon))
 
     # seasonal period inferred / provided
@@ -803,31 +736,37 @@ def tsa_j_arima(payload: ForecastIn):
         return (int(P), int(D), int(Q), int(s))
 
     # --- Choose order / seasonal_order ---
-    auto = bool(getattr(payload, "auto", True))
-    if auto:
-        # Fast candidate search (much faster than full grid search on Render/free tiers)
-        order, sorder, w = _fit_arima_fast(y_fit, sp, seasonal, maxiter=80)
+    if getattr(payload, "auto", True):
+        order, sorder, w = _fit_arima_grid(
+            y2,
+            seasonal_period=sp,
+            seasonal=seasonal,
+            max_p=max_p, max_d=max_d, max_q=max_q,
+            max_P=max_P, max_D=max_D, max_Q=max_Q
+        )
         warnings += w
     else:
-        # Optional manual order fields (if provided); otherwise use a sensible default.
-        p = int(getattr(payload, "p", 1))
-        d = int(getattr(payload, "d", 1))
-        q = int(getattr(payload, "q", 1))
-        order = (max(0, p), max(0, d), max(0, q))
+        # If you later add manual order fields to ForecastIn, use them here.
+        order = (1, 0, 0)
         sorder = (0, 0, 0, 0)
 
     sorder = normalize_sorder(sorder)
 
     def fit_and_forecast(ord_, sord_):
+        d = int(ord_[1])
+        D = int(sord_[1]) if sord_ else 0
+        simple_diff = (d > 0) or (D > 0)
+
         model = SARIMAX(
-            y_fit,
+            y2,
             order=tuple(map(int, ord_)),
             seasonal_order=tuple(map(int, sord_)),
-            # Key change: force stable solutions
-            enforce_stationarity=True,
-            enforce_invertibility=True
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            simple_differencing=simple_diff,
+            low_memory=True,
         )
-        res = model.fit(disp=False, maxiter=80)
+        res = model.fit(disp=False, maxiter=60)
         fc = res.get_forecast(steps=h)
         mean = fc.predicted_mean
         ci = fc.conf_int(alpha=0.05)

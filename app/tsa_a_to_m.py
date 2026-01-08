@@ -40,9 +40,11 @@ from pydantic import BaseModel
 
 from typing import Any
 
+from typing import Optional
+
 class SeriesIn(BaseModel):
     dates: list[str]
-    values: list[float | None]
+    values: list[Optional[float]]  # allow nulls
 
 class SummaryIn(BaseModel):
     series: SeriesIn
@@ -50,21 +52,31 @@ class SummaryIn(BaseModel):
 
 
 
-def _prep_series(series_in) -> Tuple[pd.Series, List[str], Optional[str]]:
-    warnings: List[str] = []
-    y = to_series(series_in.dates, series_in.values)
+import numpy as np
+import pandas as pd
 
-    # use provided freq if any; otherwise infer
-    freq = getattr(series_in, 'freq', None)
-    if freq is None:
-        freq = infer_freq_safe(y.index)
+def _prep_series(series: SeriesIn):
+    # dates -> datetime index
+    idx = pd.to_datetime(series.dates, errors="coerce")
 
-    # basic type/length checks
-    if len(y) < 5:
-        warnings.append("Series length < 5; many analyses may be unreliable.")
-    if y.isna().mean() > 0.4:
-        warnings.append("More than 40% missing values; consider resampling/filling.")
-    return y, warnings, freq
+    # values -> float with NaN for None/"NaN"/""
+    vals = pd.to_numeric(pd.Series(series.values), errors="coerce").astype(float)
+
+    s = pd.Series(vals.values, index=idx).sort_index()
+
+    # drop invalid dates
+    s = s[~s.index.isna()]
+
+    # (optional) remove duplicate dates (last wins)
+    s = s[~s.index.duplicated(keep="last")]
+
+    warnings = []
+    missing_count = int(s.isna().sum())
+    if missing_count > 0:
+        warnings.append(f"Missing values detected: {missing_count}")
+
+    return s, warnings, None
+
 
 def _seasonal_period_from_inputs(freq: Optional[str], seasonal_period: Optional[int]) -> int:
     if seasonal_period is not None:

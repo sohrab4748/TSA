@@ -808,6 +808,98 @@ def tsa_j_arima(payload: ForecastIn):
         return ApiOut(ok=False, result={"error": f"ARIMA fit/forecast failed: {str(e)}"}, warnings=warnings)
 
 
+
+# ---------------------------
+# K) ETS (Exponential Smoothing) forecast
+# ---------------------------
+
+@router.post("/tsa/K_ets_forecast", response_model=ApiOut)
+def tsa_k_ets(payload: ETSIn):
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    n = int(y2.shape[0])
+
+    # Frontend may send steps; schema may use horizon
+    h = int(max(1, int(getattr(payload, "horizon", getattr(payload, "steps", 30)))))
+
+    sp = _seasonal_period_from_inputs(freq, getattr(payload, "seasonal_period", None))
+
+    # Options (accept common names safely)
+    trend = getattr(payload, "trend", None)
+    seasonal = getattr(payload, "seasonal", None)
+    damped_trend = bool(getattr(payload, "damped_trend", getattr(payload, "damped", False)))
+
+    # Normalize option values
+    trend = trend if trend in ("add", "mul") else None
+    seasonal = seasonal if seasonal in ("add", "mul") else None
+
+    # Safety: don't allow seasonal if series too short
+    if seasonal is not None:
+        if sp is None or int(sp) < 2:
+            warnings.append("ETS seasonal requested but seasonal_period is invalid; disabling seasonal component.")
+            seasonal = None
+        elif n < 2 * int(sp):
+            warnings.append(f"ETS seasonal requested but series is too short for seasonal_period={int(sp)} (n={n}); disabling seasonal component.")
+            seasonal = None
+
+    # Safety: multiplicative needs strictly positive data
+    if (trend == "mul" or seasonal == "mul") and (y2.min() <= 0):
+        warnings.append("ETS multiplicative components require all values > 0; switching 'mul' components to 'add'.")
+        if trend == "mul":
+            trend = "add"
+        if seasonal == "mul":
+            seasonal = "add"
+
+    try:
+        model = ExponentialSmoothing(
+            y2,
+            trend=trend,
+            damped_trend=(damped_trend if trend else False),
+            seasonal=seasonal,
+            seasonal_periods=(int(sp) if seasonal else None),
+            initialization_method="estimated",
+        )
+
+        # Keep it fast for web use
+        res = model.fit(optimized=True)
+
+        mean = res.forecast(h)
+        x_fc = _forecast_index(y2, h)
+
+        # Approximate 95% CI using residual std (simple + fast).
+        fitted = getattr(res, "fittedvalues", None)
+        sigma = float("nan")
+        if fitted is not None:
+            resid = (y2 - fitted).dropna()
+            if resid.shape[0] >= 2:
+                sigma = float(resid.std(ddof=1))
+
+        z = 1.96
+        lower = mean - (z * sigma) if np.isfinite(sigma) else None
+        upper = mean + (z * sigma) if np.isfinite(sigma) else None
+
+        result = {
+            "model": {
+                "type": "ETS",
+                "trend": trend,
+                "seasonal": seasonal,
+                "damped_trend": bool(damped_trend if trend else False),
+                "seasonal_period_used": int(sp) if seasonal else None,
+            },
+            "horizon": h,
+            "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+        }
+        if lower is not None and upper is not None:
+            result["conf_int_95"] = {
+                "lower": _as_float_list(lower.values if hasattr(lower, "values") else lower),
+                "upper": _as_float_list(upper.values if hasattr(upper, "values") else upper),
+            }
+
+        return ApiOut(ok=True, result=result, warnings=warnings)
+
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"ETS fit/forecast failed: {str(e)}"}, warnings=warnings)
+
 # ---------------------------
 # L) Theta forecast
 # ---------------------------

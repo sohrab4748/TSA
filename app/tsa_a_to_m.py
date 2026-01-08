@@ -44,7 +44,7 @@ from typing import Optional
 
 class SeriesIn(BaseModel):
     dates: list[str]
-    values: list[Optional[float]]  # allow nulls
+    values: list[float | None]   # ✅ allow nulls from JSON
 
 class SummaryIn(BaseModel):
     series: SeriesIn
@@ -59,16 +59,11 @@ def _prep_series(series: SeriesIn):
     # dates -> datetime index
     idx = pd.to_datetime(series.dates, errors="coerce")
 
-    # values -> float with NaN for None/"NaN"/""
     vals = pd.to_numeric(pd.Series(series.values), errors="coerce").astype(float)
-
-    s = pd.Series(vals.values, index=idx).sort_index()
-
-    # drop invalid dates
+    s = pd.Series(vals.values, index=pd.to_datetime(series.dates, errors="coerce")).sort_index()
     s = s[~s.index.isna()]
-
-    # (optional) remove duplicate dates (last wins)
     s = s[~s.index.duplicated(keep="last")]
+
 
     warnings = []
     missing_count = int(s.isna().sum())

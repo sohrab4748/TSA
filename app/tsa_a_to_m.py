@@ -42,6 +42,20 @@ from typing import Any
 
 from typing import Optional
 
+def _prep_series(series):
+    import pandas as pd
+
+    # Convert date/value arrays to a pandas Series with datetime index
+    x = pd.to_datetime(series.dates)
+    y = pd.to_numeric(pd.Series(series.values), errors="coerce")
+    y.index = x
+    y = y.sort_index()
+
+    # Simple cleaning and metadata
+    warnings = []
+    freq = pd.infer_freq(y.index)
+    return y, warnings, freq
+
 # ---------------------------
 # A) Preprocess / clean
 # ---------------------------

@@ -33,14 +33,7 @@ router = APIRouter()
 # ---------------------------
 # Helpers
 # ---------------------------
-from typing import Optional
-from fastapi import Body, Query, HTTPException
 import json
-
-
-from typing import Any
-
-from typing import Optional
 
 def _prep_series(series):
     import pandas as pd
@@ -55,6 +48,177 @@ def _prep_series(series):
     warnings = []
     freq = pd.infer_freq(y.index)
     return y, warnings, freq
+
+def _as_float_list(arr: Any) -> List[Optional[float]]:
+    """Convert numpy/pandas arrays to a JSON-safe list of floats (NaN/Inf -> None)."""
+    if arr is None:
+        return []
+    try:
+        if isinstance(arr, (list, tuple)):
+            return [safe_float(v) for v in arr]
+        if hasattr(arr, "tolist"):
+            arr = arr.tolist()
+            if isinstance(arr, (list, tuple)):
+                return [safe_float(v) for v in arr]
+            return [safe_float(arr)]
+        return [safe_float(arr)]
+    except Exception:
+        try:
+            return [safe_float(v) for v in list(arr)]
+        except Exception:
+            return []
+
+def _seasonal_period_from_inputs(freq_inferred: Optional[str], seasonal_period: Optional[int]) -> int:
+    """Choose a seasonal period from explicit input or inferred frequency."""
+    if seasonal_period is not None:
+        try:
+            sp = int(seasonal_period)
+            return sp if sp > 0 else 0
+        except Exception:
+            return 0
+    try:
+        sp = int(default_seasonal_period(freq_inferred))
+        return sp if sp > 0 else 0
+    except Exception:
+        return 0
+
+def _forecast_index(y: pd.Series, h: int) -> List[Any]:
+    """Build forecast x-axis values aligned with the input series index."""
+    h = int(max(1, h))
+    idx = y.index
+    if isinstance(idx, pd.DatetimeIndex) and len(idx) >= 1:
+        last = idx[-1]
+        # Try inferred freq first
+        freq = infer_freq_safe(idx)
+        if freq:
+            try:
+                rng = pd.date_range(start=last, periods=h + 1, freq=freq)
+                return [d.isoformat() for d in rng[1:]]
+            except Exception:
+                pass
+        # Fallback to median delta (or 1 day)
+        delta = pd.Timedelta(days=1)
+        try:
+            if len(idx) >= 2:
+                d = idx.to_series().diff().dropna()
+                if len(d) > 0:
+                    md = d.median()
+                    if isinstance(md, pd.Timedelta) and md > pd.Timedelta(0):
+                        delta = md
+        except Exception:
+            pass
+        return [(last + delta * (i + 1)).isoformat() for i in range(h)]
+
+    # Non-datetime index: use integer steps if possible
+    try:
+        last_val = idx[-1]
+        last_num = float(last_val)
+        return [last_num + (i + 1) for i in range(h)]
+    except Exception:
+        return list(range(1, h + 1))
+
+def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
+    """Compute common forecast metrics on finite pairs."""
+    yt = np.asarray(y_true, dtype="float64")
+    yp = np.asarray(y_pred, dtype="float64")
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if mask.sum() == 0:
+        return {"n": 0}
+    yt = yt[mask]
+    yp = yp[mask]
+    err = yp - yt
+
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+
+    # MAPE / sMAPE
+    denom = np.where(np.abs(yt) > 1e-12, np.abs(yt), np.nan)
+    mape = float(np.nanmean(np.abs(err) / denom) * 100.0)
+
+    smape_d = (np.abs(yt) + np.abs(yp))
+    smape = float(np.nanmean(2.0 * np.abs(err) / np.where(smape_d > 1e-12, smape_d, np.nan)) * 100.0)
+
+    return {
+        "n": int(len(yt)),
+        "mae": safe_float(mae),
+        "rmse": safe_float(rmse),
+        "mape_pct": safe_float(mape),
+        "smape_pct": safe_float(smape),
+    }
+
+def _fit_arima_grid(
+    y: pd.Series,
+    seasonal_period: int,
+    seasonal: bool,
+    max_p: int, max_d: int, max_q: int,
+    max_P: int, max_D: int, max_Q: int
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int], List[str]]:
+    """Small AIC grid-search for SARIMAX orders (safe + bounded)."""
+    warnings: List[str] = []
+
+    yv = pd.to_numeric(y, errors="coerce").astype("float64").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(yv) < 8:
+        warnings.append("Series too short for auto-ARIMA; using ARIMA(0,1,0).")
+        return (0, 1, 0), (0, 0, 0, 0), warnings
+
+    seasonal_period = int(seasonal_period or 0)
+    use_seasonal = bool(seasonal) and seasonal_period >= 2
+
+    p_list = range(0, max(0, int(max_p)) + 1)
+    d_list = range(0, max(0, int(max_d)) + 1)
+    q_list = range(0, max(0, int(max_q)) + 1)
+
+    if use_seasonal:
+        P_list = range(0, max(0, int(max_P)) + 1)
+        D_list = range(0, max(0, int(max_D)) + 1)
+        Q_list = range(0, max(0, int(max_Q)) + 1)
+        s_list = [seasonal_period]
+    else:
+        P_list, D_list, Q_list, s_list = [0], [0], [0], [0]
+
+    best_aic = np.inf
+    best_order = (0, 1, 0)
+    best_sorder = (0, 0, 0, 0)
+
+    tried = 0
+    max_tries = 120  # hard cap for safety
+
+    for p in p_list:
+        for d in d_list:
+            for q in q_list:
+                if p == 0 and d == 0 and q == 0:
+                    continue
+                for P in P_list:
+                    for D in D_list:
+                        for Q in Q_list:
+                            for s in s_list:
+                                tried += 1
+                                if tried > max_tries:
+                                    warnings.append("Auto-ARIMA grid search capped; using best found so far.")
+                                    return best_order, best_sorder, warnings
+                                try:
+                                    model = SARIMAX(
+                                        yv,
+                                        order=(int(p), int(d), int(q)),
+                                        seasonal_order=(int(P), int(D), int(Q), int(s)),
+                                        enforce_stationarity=True,
+                                        enforce_invertibility=True,
+                                    )
+                                    res = model.fit(disp=False, maxiter=150)
+                                    aic = float(res.aic) if np.isfinite(res.aic) else np.inf
+                                    if aic < best_aic:
+                                        best_aic = aic
+                                        best_order = (int(p), int(d), int(q))
+                                        best_sorder = (int(P), int(D), int(Q), int(s))
+                                except Exception:
+                                    continue
+
+    if not np.isfinite(best_aic):
+        warnings.append("Auto-ARIMA failed for all candidates; using ARIMA(0,1,0).")
+        return (0, 1, 0), (0, 0, 0, 0), warnings
+
+    return best_order, best_sorder, warnings
+
 
 # ---------------------------
 # A) Preprocess / clean
@@ -373,12 +537,12 @@ def tsa_f_stationarity(payload: StationarityIn):
         out["adf_error"] = str(e)
 
     try:
-        k = kpss(y2.values, regression=payload.kpss_regression, nlags="auto")
+        kpss_res = kpss(y2.values, regression=payload.kpss_regression, nlags="auto")
         out["kpss"] = {
-            "stat": float(k[0]),
-            "pvalue": float(k[1]),
-            "nlags": int(k[2]),
-            "crit": {k: float(v) for k, v in k[3].items()},
+            "stat": float(kpss_res[0]),
+            "pvalue": float(kpss_res[1]),
+            "nlags": int(kpss_res[2]),
+            "crit": {kk: float(vv) for kk, vv in kpss_res[3].items()},
         }
     except Exception as e:
         out["kpss_error"] = str(e)

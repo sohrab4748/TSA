@@ -4,13 +4,16 @@ from pydantic import BaseModel, Field
 ModelName = Literal["naive", "seasonal_naive", "arima", "ets", "theta"]
 
 class SeriesIn(BaseModel):
-    # Either supply dates or omit for index-based series
-    dates: Optional[List[str]] = Field(default=None, description="ISO dates like 2020-01-01")
-    values: List[float]
-
-    # Optional: explicit frequency string for resampling (pandas offset alias)
-    # Examples: "D", "H", "M", "W", "Q"
+    dates: Optional[list[str]] = Field(
+        default=None,
+        description="ISO dates like 2020-01-01"
+    )
+    values: list[float | None] = Field(
+        ...,
+        description="Values; null allowed for missing"
+    )
     freq: Optional[str] = None
+
 
 class PreprocessIn(BaseModel):
     series: SeriesIn

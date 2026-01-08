@@ -815,94 +815,209 @@ def tsa_j_arima(payload: ForecastIn):
 
 @router.post("/tsa/K_ets_forecast", response_model=ApiOut)
 def tsa_k_ets(payload: ETSIn):
+    """ETS (Exponential Smoothing) forecast.
+
+    Enhancements
+    - Seasonal period: user-provided `seasonal_period` overrides; otherwise inferred from frequency and validated.
+    - Auto-structure: if user doesn't force `trend/seasonal`, try a small candidate set and pick best by AIC (fallback SSE).
+    - Output: returns the selected structure in `result.model`.
+    """
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
-    n = int(y2.shape[0])
+    if y2.shape[0] < 3:
+        return ApiOut(ok=False, result={"error": "ETS requires at least 3 non-missing points."}, warnings=warnings)
 
-    # Frontend may send steps; schema may use horizon
+    # Horizon (frontend uses `steps`, some schemas use `horizon`)
     h = int(max(1, int(getattr(payload, "horizon", getattr(payload, "steps", 30)))))
 
-    sp = _seasonal_period_from_inputs(freq, getattr(payload, "seasonal_period", None))
+    # Keep it fast on cloud instances by default
+    max_n = int(getattr(payload, "max_points", 5000))
+    if y2.shape[0] > max_n:
+        warnings.append(f"ETS: series has {int(y2.shape[0])} points; using last {max_n} points for fitting to keep it fast.")
+        y_fit = y2.iloc[-max_n:]
+    else:
+        y_fit = y2
 
-    # Options (accept common names safely)
-    trend = getattr(payload, "trend", None)
-    seasonal = getattr(payload, "seasonal", None)
-    damped_trend = bool(getattr(payload, "damped_trend", getattr(payload, "damped", False)))
+    n_fit = int(y_fit.shape[0])
+
+    # Seasonal period (auto or user)
+    sp_in = getattr(payload, "seasonal_period", None)
+    sp = int(_seasonal_period_from_inputs(freq, sp_in) or 0)
+    if sp < 2:
+        sp = 0
+
+    # Requested options (if any)
+    trend_req = getattr(payload, "trend", None)
+    seasonal_req = getattr(payload, "seasonal", None)
+    damped_req = bool(getattr(payload, "damped_trend", getattr(payload, "damped", False)))
 
     # Normalize option values
-    trend = trend if trend in ("add", "mul") else None
-    seasonal = seasonal if seasonal in ("add", "mul") else None
+    trend_req = trend_req if trend_req in ("add", "mul") else None
+    seasonal_req = seasonal_req if seasonal_req in ("add", "mul") else None
 
-    # Safety: don't allow seasonal if series too short
-    if seasonal is not None:
-        if sp is None or int(sp) < 2:
-            warnings.append("ETS seasonal requested but seasonal_period is invalid; disabling seasonal component.")
-            seasonal = None
-        elif n < 2 * int(sp):
-            warnings.append(f"ETS seasonal requested but series is too short for seasonal_period={int(sp)} (n={n}); disabling seasonal component.")
-            seasonal = None
+    # Multiplicative requires strictly positive series
+    has_nonpos = bool((y_fit <= 0).any())
+    if has_nonpos:
+        if trend_req == "mul" or seasonal_req == "mul":
+            warnings.append("ETS: multiplicative components require all values > 0; switching requested multiplicative component(s) to additive.")
+        if trend_req == "mul":
+            trend_req = "add"
+        if seasonal_req == "mul":
+            seasonal_req = "add"
 
-    # Safety: multiplicative needs strictly positive data
-    if (trend == "mul" or seasonal == "mul") and (y2.min() <= 0):
-        warnings.append("ETS multiplicative components require all values > 0; switching 'mul' components to 'add'.")
-        if trend == "mul":
-            trend = "add"
-        if seasonal == "mul":
-            seasonal = "add"
+    def _seasonal_ok(period: int) -> bool:
+        # Rule of thumb: need at least 2 full cycles
+        return int(period) >= 2 and n_fit >= 2 * int(period)
 
-    try:
-        model = ExponentialSmoothing(
-            y2,
-            trend=trend,
-            damped_trend=(damped_trend if trend else False),
-            seasonal=seasonal,
-            seasonal_periods=(int(sp) if seasonal else None),
-            initialization_method="estimated",
-        )
+    # Validate seasonal feasibility
+    if seasonal_req is not None:
+        if sp == 0:
+            warnings.append("ETS: seasonal requested but seasonal_period is missing/unknown; disabling seasonal component.")
+            seasonal_req = None
+        elif not _seasonal_ok(sp):
+            warnings.append(f"ETS: seasonal requested but series is too short for seasonal_period={int(sp)}; disabling seasonal component.")
+            seasonal_req = None
 
-        # Keep it fast for web use
-        res = model.fit(optimized=True)
+    # Determine candidate structures
+    forced = bool(getattr(payload, "force_structure", False)) or (trend_req is not None) or (seasonal_req is not None)
+    candidates = []
+    if forced:
+        candidates = [(trend_req, seasonal_req, bool(damped_req if trend_req else False), int(sp) if seasonal_req else 0)]
+    else:
+        # Small candidate set (fast + robust). Uses additive forms by default.
+        candidates.append((None, None, False, 0))          # SES (level)
+        candidates.append(("add", None, False, 0))         # Holt (trend)
+        candidates.append(("add", None, True, 0))          # Damped Holt
+        if sp and _seasonal_ok(sp):
+            candidates.append((None, "add", False, int(sp)))          # Seasonal only
+            candidates.append(("add", "add", False, int(sp)))         # Trend + seasonal
+            candidates.append(("add", "add", True, int(sp)))          # Damped trend + seasonal
 
-        mean = res.forecast(h)
-        x_fc = _forecast_index(y2, h)
+    best_res = None
+    best = None
+    best_score = None
+    best_score_name = None
+    tried = []
 
-        # Approximate 95% CI using residual std (simple + fast).
-        fitted = getattr(res, "fittedvalues", None)
-        sigma = float("nan")
-        if fitted is not None:
-            resid = (y2 - fitted).dropna()
-            if resid.shape[0] >= 2:
-                sigma = float(resid.std(ddof=1))
+    def _score(res) -> Tuple[float, str]:
+        aic = getattr(res, "aic", None)
+        if aic is not None:
+            try:
+                a = float(aic)
+                if np.isfinite(a):
+                    return a, "aic"
+            except Exception:
+                pass
+        sse = getattr(res, "sse", None)
+        if sse is not None:
+            try:
+                s = float(sse)
+                if np.isfinite(s):
+                    return s, "sse"
+            except Exception:
+                pass
+        fv = getattr(res, "fittedvalues", None)
+        if fv is not None:
+            r = (y_fit - fv).dropna()
+            if r.shape[0] > 0:
+                return float((r ** 2).sum()), "sse"
+        return float("inf"), "none"
 
+    # Fit + select the best candidate
+    import warnings as _warnings
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
+    for (tr, seas, damped, p) in candidates:
+        if seas is not None:
+            if p <= 1 or (not _seasonal_ok(p)):
+                continue
+        if has_nonpos and (tr == "mul" or seas == "mul"):
+            continue
+
+        try:
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("ignore", category=ConvergenceWarning)
+
+                model = ExponentialSmoothing(
+                    y_fit,
+                    trend=tr,
+                    damped_trend=(bool(damped) if tr else False),
+                    seasonal=seas,
+                    seasonal_periods=(int(p) if seas else None),
+                    initialization_method="estimated",
+                )
+                res = model.fit(optimized=True)
+
+            score, sname = _score(res)
+            tried.append({
+                "trend": tr,
+                "seasonal": seas,
+                "damped_trend": bool(damped) if tr else False,
+                "seasonal_periods": int(p) if seas else None,
+                "score_name": sname,
+                "score": score,
+            })
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best_score_name = sname
+                best = (tr, seas, bool(damped) if tr else False, int(p) if seas else 0)
+                best_res = res
+
+        except Exception as e:
+            tried.append({
+                "trend": tr,
+                "seasonal": seas,
+                "damped_trend": bool(damped) if tr else False,
+                "seasonal_periods": int(p) if seas else None,
+                "error": str(e),
+            })
+
+    if best_res is None or best is None:
+        return ApiOut(ok=False, result={"error": "ETS failed: no candidate model could be fitted."}, warnings=warnings)
+
+    tr, seas, damped, p = best
+
+    # Forecast
+    mean = best_res.forecast(h)
+    x_fc = _forecast_index(y2, h)  # extend dates from the full series
+
+    # Fast approximate 95% CI using residual std on the fit window
+    fv = getattr(best_res, "fittedvalues", None)
+    sigma = float("nan")
+    if fv is not None:
+        resid = (y_fit - fv).dropna()
+        if resid.shape[0] >= 2:
+            sigma = float(resid.std(ddof=1))
+
+    result = {
+        "freq_inferred": freq,
+        "seasonal_period_used": int(p) if seas else 0,
+        "model": {
+            "type": "ETS",
+            "trend": tr,
+            "seasonal": seas,
+            "damped_trend": bool(damped) if tr else False,
+            "seasonal_periods": int(p) if seas else None,
+            "score_name": best_score_name,
+            "score": best_score,
+            "aic": float(getattr(best_res, "aic", float("nan"))) if np.isfinite(float(getattr(best_res, "aic", float("nan")))) else None,
+            "sse": float(getattr(best_res, "sse", float("nan"))) if np.isfinite(float(getattr(best_res, "sse", float("nan")))) else None,
+        },
+        "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+    }
+
+    if np.isfinite(sigma):
         z = 1.96
-        lower = mean - (z * sigma) if np.isfinite(sigma) else None
-        upper = mean + (z * sigma) if np.isfinite(sigma) else None
+        lower = mean.values - (z * sigma)
+        upper = mean.values + (z * sigma)
+        result["conf_int_95"] = {"lower": _as_float_list(lower.tolist()), "upper": _as_float_list(upper.tolist())}
 
-        result = {
-            "model": {
-                "type": "ETS",
-                "trend": trend,
-                "seasonal": seasonal,
-                "damped_trend": bool(damped_trend if trend else False),
-                "seasonal_period_used": int(sp) if seasonal else None,
-            },
-            "horizon": h,
-            "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
-        }
-        if lower is not None and upper is not None:
-            result["conf_int_95"] = {
-                "lower": _as_float_list(lower.values if hasattr(lower, "values") else lower),
-                "upper": _as_float_list(upper.values if hasattr(upper, "values") else upper),
-            }
+    # Optional: return candidate scores if debug requested
+    if bool(getattr(payload, "debug", False)):
+        result["candidates"] = tried
 
-        return ApiOut(ok=True, result=result, warnings=warnings)
-
-    except Exception as e:
-        return ApiOut(ok=False, result={"error": f"ETS fit/forecast failed: {str(e)}"}, warnings=warnings)
-
-# ---------------------------
-# L) Theta forecast
-# ---------------------------
+    return ApiOut(ok=True, result=result, warnings=warnings)
 
 @router.post("/tsa/L_theta_forecast", response_model=ApiOut)
 def tsa_l_theta(payload: ThetaIn):

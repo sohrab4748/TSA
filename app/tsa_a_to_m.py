@@ -361,15 +361,32 @@ def tsa_n_wavelet_cwt(payload: WaveletIn):
         warnings.append(f"Unknown wavelet '{wavelet}', using 'morl' instead.")
         wavelet = "morl"
 
-    scales = (periods * cf) / dt
+    # IMPORTANT:
+    # - Users specify min/max period in *time steps* (e.g., 2..16 months for monthly series).
+    # - We keep `sampling_period=dt` so returned freqs/periods can be expressed in days,
+    #   but compute scales in *steps* so we don't create extremely small scales for coarse
+    #   (monthly/yearly) series.
+    #
+    # Relationship (PyWavelets): freq = central_frequency / (scale * sampling_period)
+    # => period_days = (scale * sampling_period) / central_frequency
+    # If period is provided in steps, period_days = period_steps * dt_days
+    # => scale = period_steps * central_frequency
+    scales = periods * cf
 
-    # compute CWT
-    coef, freqs = pywt.cwt(vals, scales, wavelet, sampling_period=dt)
+    # compute CWT (catch scale errors and return a clean API error instead of a hard 500)
+    try:
+        coef, freqs = pywt.cwt(vals, scales, wavelet, sampling_period=dt)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"Wavelet CWT failed: {e}"}, warnings=warnings)
     power = np.abs(coef) ** 2
 
-    # periods implied by returned freqs (safer)
+    # periods implied by returned freqs
+    # - freqs: cycles per day
+    # - periods_out_days: days
+    # - periods_out_steps: time-steps (matches user inputs)
     with np.errstate(divide="ignore", invalid="ignore"):
-        periods_out = np.where(freqs > 0, 1.0 / freqs, np.nan)
+        periods_out_days = np.where(freqs > 0, 1.0 / freqs, np.nan)
+        periods_out_steps = np.where(np.isfinite(dt) and dt > 0, periods_out_days / dt, periods_out_days)
 
     # downsample time if large
     x = y2.index.astype(str).tolist()
@@ -381,16 +398,34 @@ def tsa_n_wavelet_cwt(payload: WaveletIn):
     # global wavelet spectrum
     gws = np.nanmean(power, axis=1)
 
+    # ensure JSON-safe (no NaN/Inf). Power is large; convert efficiently.
+    power_list = power.tolist()
+    for i in range(len(power_list)):
+        row = power_list[i]
+        for j in range(len(row)):
+            v = row[j]
+            # python float('nan') can break ORJSON; normalize to None
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+                if not np.isfinite(fv):
+                    row[j] = None
+            except Exception:
+                row[j] = None
+
     result = {
         "wavelet": wavelet,
         "dt_days": dt,
         "n": int(n),
         "time": x,
-        "periods": [safe_float(p) for p in periods_out.tolist()],
-        "power": power.tolist(),             # shape: [n_scales][n_time]
+        "period_unit": "steps",
+        "periods": [safe_float(p) for p in periods_out_steps.tolist()],
+        "periods_days": [safe_float(p) for p in periods_out_days.tolist()],
+        "power": power_list,             # shape: [n_scales][n_time]
         "global_spectrum": [safe_float(v) for v in gws.tolist()],
         "notes": {
-            "suggest_plot": "Use log10(1+power) for heatmap; periods are in time-steps (days if dt=1 day)."
+            "suggest_plot": "Use log10(1+power) for heatmap; 'periods' are in time-steps; use periods_days for physical time."
         }
     }
     return ApiOut(ok=True, result=result, warnings=warnings)

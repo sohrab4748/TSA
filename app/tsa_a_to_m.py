@@ -1209,17 +1209,38 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
         # fall back to REST if SDK fails
         pass
 
-    import requests
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    body = {
-        "systemInstruction": {"parts": [{"text": system_instruction}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
-    }
-    r = requests.post(url, json=body, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Gemini REST error {r.status_code}: {r.text[:500]}")
-    data = r.json()
+    import urllib.request
+import urllib.error
+
+url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+body = {
+    "systemInstruction": {"parts": [{"text": system_instruction}]},
+    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+}
+
+req = urllib.request.Request(
+    url,
+    data=json.dumps(body).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+
+try:
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        status = getattr(resp, "status", 200)
+except urllib.error.HTTPError as e:
+    raw = e.read().decode("utf-8", errors="ignore")
+    raise RuntimeError(f"Gemini REST error {e.code}: {raw[:500]}")
+except Exception as e:
+    raise RuntimeError(f"Gemini REST request failed: {e}")
+
+if status >= 400:
+    raise RuntimeError(f"Gemini REST error {status}: {raw[:500]}")
+
+data = json.loads(raw)
+
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception:

@@ -1183,15 +1183,18 @@ def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], 
     return system, user, compact
 
 def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> str:
-    # Calls Gemini using google-genai if available, else REST fallback.
+    """Call Gemini. Prefer `google-genai` SDK if installed; otherwise use REST via urllib.
+    Returns plain text.
+    """
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable on the server.")
 
-    # Prefer the new Google GenAI SDK
+    # 1) Prefer the official Google GenAI SDK if available
     try:
         from google import genai
         from google.genai import types
+
         client = genai.Client(api_key=api_key)
         resp = client.models.generate_content(
             model=model,
@@ -1204,46 +1207,49 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
         )
         return (resp.text or "").strip()
     except ImportError:
+        # SDK not installed; fall back to REST
         pass
     except Exception:
-        # fall back to REST if SDK fails
+        # If the SDK is installed but fails for some reason, try REST as a fallback
         pass
 
+    # 2) REST fallback (no extra deps)
     import urllib.request
-import urllib.error
+    import urllib.error
 
-url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-body = {
-    "systemInstruction": {"parts": [{"text": system_instruction}]},
-    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
-}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+    }
 
-req = urllib.request.Request(
-    url,
-    data=json.dumps(body).encode("utf-8"),
-    headers={"Content-Type": "application/json"},
-    method="POST",
-)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
 
-try:
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
-        status = getattr(resp, "status", 200)
-except urllib.error.HTTPError as e:
-    raw = e.read().decode("utf-8", errors="ignore")
-    raise RuntimeError(f"Gemini REST error {e.code}: {raw[:500]}")
-except Exception as e:
-    raise RuntimeError(f"Gemini REST request failed: {e}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status = getattr(resp, "status", 200) or 200
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Gemini REST error {e.code}: {raw[:500]}")
+    except Exception as e:
+        raise RuntimeError(f"Gemini REST request failed: {e}")
 
-if status >= 400:
-    raise RuntimeError(f"Gemini REST error {status}: {raw[:500]}")
+    if status >= 400:
+        raise RuntimeError(f"Gemini REST error {status}: {raw[:500]}")
 
-data = json.loads(raw)
+    data = json.loads(raw)
 
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception:
+        # Return a compact version of the raw JSON for debugging
         return json.dumps(data)[:2000]
 
 @router.post("/ai/interpret", response_model=ApiOut)

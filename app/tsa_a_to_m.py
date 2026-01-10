@@ -1184,7 +1184,7 @@ def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], 
 
 def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> str:
     # Calls Gemini using google-genai if available, else REST fallback.
-    api_key = os.getenv("AIzaSyDPBPtwet0IMrLtNIVMvnMMnKk4rWoSSqg") or os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable on the server.")
 

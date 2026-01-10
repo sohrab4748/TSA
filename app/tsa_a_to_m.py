@@ -3,6 +3,10 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Body, Query, HTTPException
+import os
+from datetime import datetime
+from pydantic import BaseModel, Field
+
 import pywt
 from scipy.signal import detrend as sp_detrend
 
@@ -1081,3 +1085,161 @@ def tsa_m_backtest(payload: BacktestIn):
         "metrics": met,
     }
     return ApiOut(ok=True, result=result, warnings=warnings)
+
+
+# ---------------------------
+# AI Interpretation (Gemini): /analysis/ai/interpret (mounted via /analysis prefix in main)
+# ---------------------------
+
+class AIInterpretIn(BaseModel):
+    provider: str = Field(default="gemini")
+    style: str = Field(default="technical")  # technical | simple | executive
+    extra_instruction: str = Field(default="")
+    series: SeriesIn
+    series_meta: Dict[str, Any] = Field(default_factory=dict)
+    analyses: List[Dict[str, Any]] = Field(default_factory=list)
+    model: Optional[str] = Field(default=None)  # optional override, e.g. "gemini-2.0-flash"
+    debug: bool = Field(default=False)
+
+def _compact_series_for_ai(y: pd.Series, max_points: int = 300) -> Dict[str, Any]:
+    # Return a compact representation of the series to keep prompts small
+    y2 = y.copy()
+    y2 = pd.to_numeric(y2, errors="coerce").dropna()
+    if len(y2) == 0:
+        return {"n": 0, "preview": []}
+    if len(y2) > max_points:
+        y2 = y2.iloc[-max_points:]
+
+    rows = []
+    for idx, val in y2.items():
+        if isinstance(idx, (pd.Timestamp, datetime)):
+            t = pd.Timestamp(idx).isoformat()
+        else:
+            t = str(idx)
+        rows.append([t, safe_float(val)])
+    return {"n": int(len(y2)), "preview": rows}
+
+def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], warnings: List[str]):
+    # Returns (system_instruction, user_prompt, compact_context)
+    y_clean = pd.to_numeric(y, errors="coerce")
+    stats = {
+        "n": int(len(y_clean)),
+        "start": y_clean.index[0].isoformat() if isinstance(y_clean.index, pd.DatetimeIndex) and len(y_clean) else None,
+        "end": y_clean.index[-1].isoformat() if isinstance(y_clean.index, pd.DatetimeIndex) and len(y_clean) else None,
+        "freq_inferred": freq,
+        "min": safe_float(np.nanmin(y_clean.values)) if len(y_clean) else None,
+        "max": safe_float(np.nanmax(y_clean.values)) if len(y_clean) else None,
+        "mean": safe_float(np.nanmean(y_clean.values)) if len(y_clean) else None,
+        "std": safe_float(np.nanstd(y_clean.values)) if len(y_clean) else None,
+    }
+
+    compact = {
+        "series_meta": payload.series_meta or {},
+        "series_stats": stats,
+        "series_preview": _compact_series_for_ai(y_clean),
+        "selected_analyses": [],
+        "warnings": warnings or [],
+    }
+
+    for a in (payload.analyses or []):
+        compact["selected_analyses"].append({
+            "analysis_id": a.get("analysis_id"),
+            "analysis_label": a.get("analysis_label"),
+            "ran_at": a.get("ran_at"),
+            "inputs": a.get("inputs") or {},
+            "summary": a.get("summary"),
+        })
+
+    style = (payload.style or "technical").strip().lower()
+    if style not in ("technical", "simple", "executive"):
+        style = "technical"
+
+    system = (
+        "You are a time series analysis expert. "
+        "Use ONLY the provided context and numbers. "
+        "If something is not provided, say 'not provided'. "
+        "Do not invent data."
+    )
+    if style == "simple":
+        system += " Write for a non-technical audience using plain language."
+    elif style == "executive":
+        system += " Write a short executive summary with clear bullets and recommendations."
+    else:
+        system += " Write a technical interpretation with concise explanations."
+
+    if payload.extra_instruction:
+        system += f" Additional instruction: {payload.extra_instruction.strip()}"
+
+    user = (
+        "Interpret the following time-series results from a web dashboard.\n"
+        "Tasks:\n"
+        "1) Briefly describe the series behavior (trend/seasonality/volatility) using the provided stats and preview.\n"
+        "2) For each selected analysis, explain what it means and what it suggests.\n"
+        "3) Give 3–5 practical next steps (e.g., preprocessing, model choice, parameter checks).\n\n"
+        "Context (JSON):\n"
+        f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n"
+    )
+
+    return system, user, compact
+
+def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> str:
+    # Calls Gemini using google-genai if available, else REST fallback.
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable on the server.")
+
+    # Prefer the new Google GenAI SDK
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,
+                max_output_tokens=900,
+            ),
+        )
+        return (resp.text or "").strip()
+    except ImportError:
+        pass
+    except Exception:
+        # fall back to REST if SDK fails
+        pass
+
+    import requests
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+    }
+    r = requests.post(url, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Gemini REST error {r.status_code}: {r.text[:500]}")
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        return json.dumps(data)[:2000]
+
+@router.post("/ai/interpret", response_model=ApiOut)
+def ai_interpret(payload: AIInterpretIn = Body(...)):
+    # Server-side AI interpretation: build prompt in code, call Gemini, return text
+    try:
+        y, warnings, freq = _prep_series(payload.series)
+        system, user, compact = _build_ai_prompt(payload, y, freq, warnings)
+        model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash"
+
+        text = _call_gemini_text(system, user, model=model)
+        result = {"text": text, "model": model, "style": payload.style}
+
+        if payload.debug:
+            result["context"] = compact
+            result["system_instruction"] = system
+
+        return ApiOut(ok=True, result=result, warnings=warnings)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": str(e)}, warnings=[])

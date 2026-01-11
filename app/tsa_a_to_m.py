@@ -1243,8 +1243,8 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
                     t = getattr(p, "text", None)
                 if t:
                     out.append(str(t))
-            return "
-".join(out).strip()
+            return "\n".join(out).strip()
+
         except Exception:
             return ""
 

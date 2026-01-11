@@ -1101,7 +1101,7 @@ class AIInterpretIn(BaseModel):
     model: Optional[str] = Field(default=None)  # optional override, e.g. "gemini-2.0-flash"
     debug: bool = Field(default=False)
 
-def _compact_series_for_ai(y: pd.Series, max_points: int = 300) -> Dict[str, Any]:
+def _compact_series_for_ai(y: pd.Series, max_points: int = 120) -> Dict[str, Any]:
     # Return a compact representation of the series to keep prompts small
     y2 = y.copy()
     y2 = pd.to_numeric(y2, errors="coerce").dropna()
@@ -1150,7 +1150,29 @@ def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], 
             "summary": a.get("summary"),
         })
 
-    style = (payload.style or "technical").strip().lower()
+    # Guard: keep the context reasonably small (avoid token blow-ups).
+def _trim_obj(obj, max_list=80, max_str=4000, depth=3):
+    if depth <= 0:
+        return obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[k] = _trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1)
+        return out
+    if isinstance(obj, list):
+        if len(obj) <= max_list:
+            return [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1) for v in obj]
+        head = obj[:max(10, max_list-10)]
+        tail = obj[-5:]
+        return {"n": len(obj), "head": [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1) for v in head],
+                "tail": [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1) for v in tail]}
+    if isinstance(obj, str):
+        return obj if len(obj) <= max_str else (obj[:max_str] + "…(truncated)")
+    return obj
+
+compact = _trim_obj(compact)
+
+style = (payload.style or "technical").strip().lower()
     if style not in ("technical", "simple", "executive"):
         style = "technical"
 
@@ -1177,41 +1199,57 @@ def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], 
         "2) For each selected analysis, explain what it means and what it suggests.\n"
         "3) Give 3–5 practical next steps (e.g., preprocessing, model choice, parameter checks).\n\n"
         "Context (JSON):\n"
-        f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n"
+        f"{json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)}\n"
     )
 
     return system, user, compact
 
 def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> str:
-    """Call Gemini. Prefer `google-genai` SDK if installed; otherwise use REST via urllib.
+    """
+    Call Gemini. Prefer `google-genai` SDK if installed; otherwise use REST via urllib.
+    Adds exponential backoff for transient 429/503.
     Returns plain text.
     """
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable on the server.")
 
-    # 1) Prefer the official Google GenAI SDK if available
-    try:
-        from google import genai
-        from google.genai import types
+    def _should_retry(msg: str) -> bool:
+        s = (msg or "").lower()
+        return (" 429" in s) or ("too many" in s) or ("rate limit" in s) or ("quota" in s) or (" 503" in s) or ("service unavailable" in s)
 
-        client = genai.Client(api_key=api_key)
-        resp = client.models.generate_content(
-            model=model,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2,
-                max_output_tokens=900,
-            ),
-        )
-        return (resp.text or "").strip()
-    except ImportError:
-        # SDK not installed; fall back to REST
-        pass
-    except Exception:
-        # If the SDK is installed but fails for some reason, try REST as a fallback
-        pass
+    def _sleep_backoff(attempt: int):
+        import time, random
+        base = 2 ** attempt  # 1,2,4
+        time.sleep(base + random.random() * 0.25)
+
+    last_err: Optional[Exception] = None
+
+    # 1) SDK attempt (if installed)
+    for attempt in range(3):
+        try:
+            from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
+
+            client = genai.Client(api_key=api_key)
+            resp = client.models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                    max_output_tokens=900,
+                ),
+            )
+            return (resp.text or "").strip()
+        except ImportError:
+            break
+        except Exception as e:
+            last_err = e
+            if _should_retry(str(e)) and attempt < 2:
+                _sleep_backoff(attempt)
+                continue
+            break  # try REST
 
     # 2) REST fallback (no extra deps)
     import urllib.request
@@ -1219,46 +1257,56 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     body = {
+        "contents": [{"parts": [{"text": user_prompt}]}],
         "systemInstruction": {"parts": [{"text": system_instruction}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
     }
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+                status = getattr(resp, "status", 200) or 200
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            status = getattr(resp, "status", 200) or 200
-            raw = resp.read().decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Gemini REST error {e.code}: {raw[:500]}")
-    except Exception as e:
-        raise RuntimeError(f"Gemini REST request failed: {e}")
+            if status >= 400:
+                raise RuntimeError(f"Gemini REST error {status}: {raw[:1200]}")
 
-    if status >= 400:
-        raise RuntimeError(f"Gemini REST error {status}: {raw[:500]}")
+            data = json.loads(raw)
+            try:
+                return (data["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
+            except Exception:
+                return json.dumps(data)[:2000]
 
-    data = json.loads(raw)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="ignore")
+            msg = f"Gemini REST error {e.code}: {raw[:1200]}"
+            last_err = RuntimeError(msg)
+            if e.code in (429, 503) and attempt < 2:
+                _sleep_backoff(attempt)
+                continue
+            raise last_err
 
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        # Return a compact version of the raw JSON for debugging
-        return json.dumps(data)[:2000]
+        except Exception as e:
+            last_err = e
+            if _should_retry(str(e)) and attempt < 2:
+                _sleep_backoff(attempt)
+                continue
+            raise RuntimeError(f"Gemini REST request failed: {e}")
 
-@router.post("/ai/interpret", response_model=ApiOut)
+    raise RuntimeError(f"Gemini request failed: {last_err}")
+
 def ai_interpret(payload: AIInterpretIn = Body(...)):
     # Server-side AI interpretation: build prompt in code, call Gemini, return text
     try:
         y, warnings, freq = _prep_series(payload.series)
         system, user, compact = _build_ai_prompt(payload, y, freq, warnings)
-        model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash"
+        model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
 
         text = _call_gemini_text(system, user, model=model)
         result = {"text": text, "model": model, "style": payload.style}

@@ -1088,6 +1088,7 @@ def tsa_m_backtest(payload: BacktestIn):
 
 
 # ---------------------------
+# ---------------------------
 # AI Interpretation (Gemini): /analysis/ai/interpret (mounted via /analysis prefix in main)
 # ---------------------------
 
@@ -1098,34 +1099,65 @@ class AIInterpretIn(BaseModel):
     series: SeriesIn
     series_meta: Dict[str, Any] = Field(default_factory=dict)
     analyses: List[Dict[str, Any]] = Field(default_factory=list)
-    model: Optional[str] = Field(default=None)  # optional override, e.g. "gemini-2.0-flash"
+    model: Optional[str] = Field(default=None)  # optional override, e.g. "gemini-2.5-flash"
     debug: bool = Field(default=False)
 
-def _compact_series_for_ai(y: pd.Series, max_points: int = 120) -> Dict[str, Any]:
-    # Return a compact representation of the series to keep prompts small
-    y2 = y.copy()
-    y2 = pd.to_numeric(y2, errors="coerce").dropna()
-    if len(y2) == 0:
-        return {"n": 0, "preview": []}
-    if len(y2) > max_points:
-        y2 = y2.iloc[-max_points:]
 
-    rows = []
+def _compact_series_for_ai(y: pd.Series, max_points: int = 160) -> Dict[str, Any]:
+    # Compact series preview for LLM context
+    y2 = pd.to_numeric(y, errors="coerce").dropna()
+    n = int(len(y2))
+    if n == 0:
+        return {"n": 0, "preview": []}
+
+    # Take last max_points (keeps recent behavior for forecasts)
+    if n > max_points:
+        y2 = y2.iloc[-max_points:]
+        n = int(len(y2))
+
+    rows: List[List[Any]] = []
     for idx, val in y2.items():
         if isinstance(idx, (pd.Timestamp, datetime)):
-            t = pd.Timestamp(idx).isoformat()
+            t = pd.Timestamp(idx).date().isoformat()
         else:
             t = str(idx)
         rows.append([t, safe_float(val)])
-    return {"n": int(len(y2)), "preview": rows}
+
+    return {"n": n, "preview": rows}
+
+
+def _trim_obj(obj, max_list: int = 80, max_str: int = 2500, depth: int = 3):
+    # Trim nested dict/list/strings to avoid huge prompts
+    if depth <= 0:
+        return obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[k] = _trim_obj(v, max_list=max_list, max_str=max_str, depth=depth - 1)
+        return out
+    if isinstance(obj, list):
+        if len(obj) <= max_list:
+            return [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth - 1) for v in obj]
+        head = obj[: max(10, max_list - 10)]
+        tail = obj[-5:]
+        return {
+            "n": len(obj),
+            "head": [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth - 1) for v in head],
+            "tail": [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth - 1) for v in tail],
+        }
+    if isinstance(obj, str):
+        return obj if len(obj) <= max_str else (obj[:max_str] + "…(truncated)")
+    return obj
+
 
 def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], warnings: List[str]):
     # Returns (system_instruction, user_prompt, compact_context)
     y_clean = pd.to_numeric(y, errors="coerce")
+
     stats = {
         "n": int(len(y_clean)),
-        "start": y_clean.index[0].isoformat() if isinstance(y_clean.index, pd.DatetimeIndex) and len(y_clean) else None,
-        "end": y_clean.index[-1].isoformat() if isinstance(y_clean.index, pd.DatetimeIndex) and len(y_clean) else None,
+        "start": y_clean.index[0].date().isoformat() if isinstance(y_clean.index, pd.DatetimeIndex) and len(y_clean) else None,
+        "end": y_clean.index[-1].date().isoformat() if isinstance(y_clean.index, pd.DatetimeIndex) and len(y_clean) else None,
         "freq_inferred": freq,
         "min": safe_float(np.nanmin(y_clean.values)) if len(y_clean) else None,
         "max": safe_float(np.nanmax(y_clean.values)) if len(y_clean) else None,
@@ -1142,37 +1174,19 @@ def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], 
     }
 
     for a in (payload.analyses or []):
-        compact["selected_analyses"].append({
-            "analysis_id": a.get("analysis_id"),
-            "analysis_label": a.get("analysis_label"),
-            "ran_at": a.get("ran_at"),
-            "inputs": a.get("inputs") or {},
-            "summary": a.get("summary"),
-        })
+        compact["selected_analyses"].append(
+            {
+                "analysis_id": a.get("analysis_id"),
+                "analysis_label": a.get("analysis_label"),
+                "ran_at": a.get("ran_at"),
+                "inputs": a.get("inputs") or {},
+                "summary": a.get("summary"),
+            }
+        )
 
-    # Guard: keep the context reasonably small (avoid token blow-ups).
-def _trim_obj(obj, max_list=80, max_str=4000, depth=3):
-    if depth <= 0:
-        return obj
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            out[k] = _trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1)
-        return out
-    if isinstance(obj, list):
-        if len(obj) <= max_list:
-            return [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1) for v in obj]
-        head = obj[:max(10, max_list-10)]
-        tail = obj[-5:]
-        return {"n": len(obj), "head": [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1) for v in head],
-                "tail": [_trim_obj(v, max_list=max_list, max_str=max_str, depth=depth-1) for v in tail]}
-    if isinstance(obj, str):
-        return obj if len(obj) <= max_str else (obj[:max_str] + "…(truncated)")
-    return obj
+    compact = _trim_obj(compact)
 
-compact = _trim_obj(compact)
-
-style = (payload.style or "technical").strip().lower()
+    style = (payload.style or "technical").strip().lower()
     if style not in ("technical", "simple", "executive"):
         style = "technical"
 
@@ -1189,120 +1203,111 @@ style = (payload.style or "technical").strip().lower()
     else:
         system += " Write a technical interpretation with concise explanations."
 
-    if payload.extra_instruction:
-        system += f" Additional instruction: {payload.extra_instruction.strip()}"
+    extra = (payload.extra_instruction or "").strip()
+    if extra:
+        system += " Extra instruction: " + extra
 
     user = (
-        "Interpret the following time-series results from a web dashboard.\n"
-        "Tasks:\n"
-        "1) Briefly describe the series behavior (trend/seasonality/volatility) using the provided stats and preview.\n"
+        "Interpret the selected time-series analyses.\n"
+        "1) Summarize the series behavior.\n"
         "2) For each selected analysis, explain what it means and what it suggests.\n"
-        "3) Give 3–5 practical next steps (e.g., preprocessing, model choice, parameter checks).\n\n"
+        "3) Give 3–5 practical next steps (preprocessing, parameter checks, model choices).\n\n"
         "Context (JSON):\n"
-        f"{json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)}\n"
+        f"{json.dumps(compact, ensure_ascii=False, separators=(',', ':'), default=str)}\n"
     )
 
     return system, user, compact
 
+
 def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> str:
-    """
-    Call Gemini. Prefer `google-genai` SDK if installed; otherwise use REST via urllib.
-    Adds exponential backoff for transient 429/503.
-    Returns plain text.
-    """
+    # Call Gemini. Prefer `google-genai` SDK if installed; otherwise use REST via urllib.
+    # Adds exponential backoff for transient 429/503. Returns plain text.
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable on the server.")
 
-    def _should_retry(msg: str) -> bool:
-        s = (msg or "").lower()
-        return (" 429" in s) or ("too many" in s) or ("rate limit" in s) or ("quota" in s) or (" 503" in s) or ("service unavailable" in s)
+    # 1) Prefer the official Google GenAI SDK if available
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
 
-    def _sleep_backoff(attempt: int):
-        import time, random
-        base = 2 ** attempt  # 1,2,4
-        time.sleep(base + random.random() * 0.25)
-
-    last_err: Optional[Exception] = None
-
-    # 1) SDK attempt (if installed)
-    for attempt in range(3):
-        try:
-            from google import genai  # type: ignore
-            from google.genai import types  # type: ignore
-
-            client = genai.Client(api_key=api_key)
-            resp = client.models.generate_content(
-                model=model,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.2,
-                    max_output_tokens=900,
-                ),
-            )
-            return (resp.text or "").strip()
-        except ImportError:
-            break
-        except Exception as e:
-            last_err = e
-            if _should_retry(str(e)) and attempt < 2:
-                _sleep_backoff(attempt)
-                continue
-            break  # try REST
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,
+                max_output_tokens=900,
+            ),
+        )
+        txt = getattr(resp, "text", None)
+        if txt:
+            return str(txt).strip()
+    except ImportError:
+        # SDK not installed; fall back to REST
+        pass
+    except Exception:
+        # If SDK fails, try REST
+        pass
 
     # 2) REST fallback (no extra deps)
     import urllib.request
     import urllib.error
+    import time
+    import random
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     body = {
-        "contents": [{"parts": [{"text": user_prompt}]}],
         "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
     }
 
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    last_err: Optional[Exception] = None
     for attempt in range(3):
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore")
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 status = getattr(resp, "status", 200) or 200
-
-            if status >= 400:
-                raise RuntimeError(f"Gemini REST error {status}: {raw[:1200]}")
-
-            data = json.loads(raw)
-            try:
-                return (data["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
-            except Exception:
-                return json.dumps(data)[:2000]
+                raw = resp.read().decode("utf-8", errors="ignore")
+                if status >= 400:
+                    raise RuntimeError(f"Gemini REST error {status}: {raw[:800]}")
+                data = json.loads(raw)
+                try:
+                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    return json.dumps(data)[:2000]
 
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", errors="ignore")
             msg = f"Gemini REST error {e.code}: {raw[:1200]}"
             last_err = RuntimeError(msg)
             if e.code in (429, 503) and attempt < 2:
-                _sleep_backoff(attempt)
+                time.sleep((2 ** attempt) + random.random() * 0.25)
                 continue
             raise last_err
 
         except Exception as e:
             last_err = e
-            if _should_retry(str(e)) and attempt < 2:
-                _sleep_backoff(attempt)
+            s = str(e).lower()
+            if (("429" in s) or ("too many" in s) or ("rate" in s) or ("quota" in s) or ("503" in s) or ("service unavailable" in s)) and attempt < 2:
+                time.sleep((2 ** attempt) + random.random() * 0.25)
                 continue
             raise RuntimeError(f"Gemini REST request failed: {e}")
 
     raise RuntimeError(f"Gemini request failed: {last_err}")
 
+
+@router.post("/ai/interpret", response_model=ApiOut)
 def ai_interpret(payload: AIInterpretIn = Body(...)):
-    # Server-side AI interpretation: build prompt in code, call Gemini, return text
+    # Server-side AI interpretation: build prompt in code, call Gemini, return text.
     try:
         y, warnings, freq = _prep_series(payload.series)
         system, user, compact = _build_ai_prompt(payload, y, freq, warnings)

@@ -1220,11 +1220,33 @@ def _build_ai_prompt(payload: AIInterpretIn, y: pd.Series, freq: Optional[str], 
 
 
 def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> str:
-    # Call Gemini. Prefer `google-genai` SDK if installed; otherwise use REST via urllib.
-    # Adds exponential backoff for transient 429/503. Returns plain text.
+    """
+    Call Gemini and return plain text.
+
+    Notes:
+    - Prefer the official `google-genai` SDK when available.
+    - Some Gemini responses may split text across multiple `parts`; we therefore
+      concatenate all text parts (SDK + REST) instead of only the first one.
+    - Includes basic retry/backoff for transient 429/503.
+    """
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable on the server.")
+
+    def _join_text_parts(parts) -> str:
+        try:
+            out = []
+            for p in (parts or []):
+                if isinstance(p, dict):
+                    t = p.get("text")
+                else:
+                    t = getattr(p, "text", None)
+                if t:
+                    out.append(str(t))
+            return "
+".join(out).strip()
+        except Exception:
+            return ""
 
     # 1) Prefer the official Google GenAI SDK if available
     try:
@@ -1238,9 +1260,24 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                max_output_tokens=900,
+                max_output_tokens=1200,
             ),
         )
+
+        # Robust extraction: concatenate all text parts from the top candidate
+        try:
+            cands = getattr(resp, "candidates", None) or []
+            if cands:
+                cand0 = cands[0]
+                content = getattr(cand0, "content", None)
+                parts = getattr(content, "parts", None) if content is not None else None
+                txt = _join_text_parts(parts)
+                if txt:
+                    return txt
+        except Exception:
+            pass
+
+        # Fallback: resp.text (may already be concatenated, but sometimes isn't)
         txt = getattr(resp, "text", None)
         if txt:
             return str(txt).strip()
@@ -1261,7 +1298,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     body = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1200},
     }
 
     req = urllib.request.Request(
@@ -1280,10 +1317,18 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
                 if status >= 400:
                     raise RuntimeError(f"Gemini REST error {status}: {raw[:800]}")
                 data = json.loads(raw)
+
+                # Concatenate all text parts from the first candidate
                 try:
-                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    parts = data["candidates"][0]["content"]["parts"]
+                    txt = _join_text_parts(parts)
+                    if txt:
+                        return txt
                 except Exception:
-                    return json.dumps(data)[:2000]
+                    pass
+
+                # As a last resort, return the raw JSON (trimmed)
+                return json.dumps(data)[:2000]
 
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", errors="ignore")
@@ -1303,7 +1348,6 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
             raise RuntimeError(f"Gemini REST request failed: {e}")
 
     raise RuntimeError(f"Gemini request failed: {last_err}")
-
 
 @router.post("/ai/interpret", response_model=ApiOut)
 def ai_interpret(payload: AIInterpretIn = Body(...)):

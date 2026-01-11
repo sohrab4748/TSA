@@ -1244,7 +1244,6 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
                 if t:
                     out.append(str(t))
             return "\n".join(out).strip()
-
         except Exception:
             return ""
 
@@ -1260,7 +1259,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                max_output_tokens=1200,
+                max_output_tokens=1600,
             ),
         )
 
@@ -1298,7 +1297,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     body = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1200},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1600},
     }
 
     req = urllib.request.Request(
@@ -1358,6 +1357,33 @@ def ai_interpret(payload: AIInterpretIn = Body(...)):
         model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
 
         text = _call_gemini_text(system, user, model=model)
+        # If the model stops early (e.g., only section 1), ask once more to continue.
+        def _needs_continue(t: str) -> bool:
+            if not t:
+                return True
+            t_low = t.lower()
+            # Expect at least sections 1,2,3 or an explicit 'next steps' section.
+            has2 = ('### 2' in t_low) or ('## 2' in t_low) or ('2)' in t_low)
+            has3 = ('### 3' in t_low) or ('## 3' in t_low) or ('3)' in t_low) or ('next steps' in t_low)
+            # Also treat a mid-sentence ending as incomplete.
+            ends_ok = t.strip().endswith(('.', '!', '?', ':'))
+            too_short = len(t.strip()) < 400
+            return (not (has2 and has3)) or (too_short and not ends_ok)
+
+        if _needs_continue(text):
+            tail = text[-1200:] if text else ''
+            user2 = (
+                'Continue the interpretation from where you stopped.\n'
+                'Do NOT repeat section 1. Provide sections 2 and 3 clearly.\n\n'
+                'Previous text (tail):\n' + tail + '\n\n'
+                'Context (same JSON, abbreviated):\n' + json.dumps(compact, ensure_ascii=False, separators=(",",":"), default=str) + '\n'
+            )
+            try:
+                text2 = _call_gemini_text(system, user2, model=model)
+                if text2 and text2.strip() and text2.strip() not in text:
+                    text = (text.rstrip() + '\n\n' + text2.strip()).strip()
+            except Exception:
+                pass
         result = {"text": text, "model": model, "style": payload.style}
 
         if payload.debug:

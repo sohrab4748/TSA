@@ -20,7 +20,6 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.forecasting.theta import ThetaModel
-import requests
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.schemas import (

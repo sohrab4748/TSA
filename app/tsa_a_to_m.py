@@ -1517,9 +1517,32 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     raise RuntimeError(f"Gemini request failed: {last_err}")
 
 @router.post("/ai/interpret", response_model=ApiOut)
-def ai_interpret(payload: AIInterpretIn = Body(...), user_claims: Dict[str, Any] = Depends(require_auth)):
+def ai_interpret(
+    payload: AIInterpretIn = Body(...),
+    user_claims: Dict[str, Any] = Depends(require_auth),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer),
+):
     # Server-side AI interpretation: build prompt in code, call Gemini, return text.
     try:
+        # Resolve user email (access token may not include it). We fetch from Auth0 /userinfo if needed.
+        token = creds.credentials if creds else None
+        email = user_claims.get("email")
+        if token and not email:
+            try:
+                req = urllib.request.Request(
+                    f"https://{_AUTH0_DOMAIN}/userinfo",
+                    headers={"Authorization": f"Bearer {token}"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    u = json.loads(r.read().decode("utf-8"))
+                email = u.get("email")
+            except Exception:
+                email = None
+
+        # Enforce plan: Pro users only
+        require_pro(email)
+
         y, warnings, freq = _prep_series(payload.series)
         system, user, compact = _build_ai_prompt(payload, y, freq, warnings)
         model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"

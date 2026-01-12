@@ -188,6 +188,15 @@ _PAID_EMAILS = {
     if e.strip()
 }
 
+
+def require_pro(email: str | None):
+    plan = get_user_plan(email)
+    if plan != "pro":
+        raise HTTPException(
+            status_code=403,
+            detail="Upgrade required: AI Interpretation is available on the Pro plan."
+        )
+
 def get_user_plan(email: str | None) -> str:
     if not email:
         return "free"

@@ -20,6 +20,7 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.forecasting.theta import ThetaModel
+from typing import Optional
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.schemas import (
@@ -142,28 +143,32 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token.")
 
+from typing import Optional
+from fastapi.security import HTTPAuthorizationCredentials
+
 @router.get("/account/me")
 def account_me(
     user_claims=Depends(require_auth),
-    creds: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer),
 ):
-    token = creds.credentials  # raw bearer token from the request
+    # token used to call /userinfo
+    token = creds.credentials if creds else None
 
     email = user_claims.get("email")
     email_verified = user_claims.get("email_verified")
 
-    # If email isn't in token, fetch it from Auth0 userinfo
-    if not email:
+    # If email isn't in the JWT, fetch it from Auth0 /userinfo
+    if token and not email:
         try:
-            r = requests.get(
+            req = urllib.request.Request(
                 f"https://{_AUTH0_DOMAIN}/userinfo",
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
+                method="GET",
             )
-            if r.ok:
-                u = r.json()
-                email = u.get("email")
-                email_verified = u.get("email_verified")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                u = json.loads(r.read().decode("utf-8"))
+            email = u.get("email")
+            email_verified = u.get("email_verified")
         except Exception:
             pass
 
@@ -176,8 +181,6 @@ def account_me(
             "plan": "free",
         },
     }
-
-
 
 # ---------------------------
 # Helpers

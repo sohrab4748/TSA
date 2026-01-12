@@ -20,6 +20,8 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.forecasting.theta import ThetaModel
+import requests
+from fastapi.security import HTTPAuthorizationCredentials
 
 from app.schemas import (
     ApiOut,
@@ -142,17 +144,40 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
         raise HTTPException(status_code=401, detail="Invalid token.")
 
 @router.get("/account/me")
-def account_me(user_claims=Depends(require_auth)):
-    # Auth0 claims usually include: sub, email, email_verified
+def account_me(
+    user_claims=Depends(require_auth),
+    creds: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    token = creds.credentials  # raw bearer token from the request
+
+    email = user_claims.get("email")
+    email_verified = user_claims.get("email_verified")
+
+    # If email isn't in token, fetch it from Auth0 userinfo
+    if not email:
+        try:
+            r = requests.get(
+                f"https://{_AUTH0_DOMAIN}/userinfo",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if r.ok:
+                u = r.json()
+                email = u.get("email")
+                email_verified = u.get("email_verified")
+        except Exception:
+            pass
+
     return {
         "ok": True,
         "user": {
             "sub": user_claims.get("sub"),
-            "email": user_claims.get("email"),
-            "email_verified": user_claims.get("email_verified"),
-            "plan": "free"  # hardcode for now; we’ll connect payments later
-        }
+            "email": email,
+            "email_verified": email_verified,
+            "plan": "free",
+        },
     }
+
 
 
 # ---------------------------

@@ -141,6 +141,20 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token.")
 
+@router.get("/account/me")
+def account_me(user_claims=Depends(require_auth)):
+    # Auth0 claims usually include: sub, email, email_verified
+    return {
+        "ok": True,
+        "user": {
+            "sub": user_claims.get("sub"),
+            "email": user_claims.get("email"),
+            "email_verified": user_claims.get("email_verified"),
+            "plan": "free"  # hardcode for now; we’ll connect payments later
+        }
+    }
+
+
 # ---------------------------
 # Helpers
 # ---------------------------

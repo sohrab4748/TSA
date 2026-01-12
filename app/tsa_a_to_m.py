@@ -2,7 +2,8 @@
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Body, Query, HTTPException
+from fastapi import APIRouter, Body, Query, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -33,6 +34,104 @@ from app.utils import (
 )
 
 router = APIRouter()
+
+# ---------------------------
+# Auth0 JWT protection (for premium endpoints like AI interpretation)
+# ---------------------------
+# Required Render env vars:
+#   AUTH0_DOMAIN   = agrimetsoft.us.auth0.com
+#   AUTH0_AUDIENCE = https://tsa-api
+#   AUTH0_ISSUER   = https://agrimetsoft.us.auth0.com/
+#
+# Required dependency:
+#   python-jose[cryptography]
+#
+import time
+import urllib.request
+import urllib.error
+try:
+    from jose import jwt  # type: ignore
+    from jose.exceptions import JWTError, ExpiredSignatureError  # type: ignore
+    _JOSE_OK = True
+except Exception:  # pragma: no cover
+    jwt = None  # type: ignore
+    JWTError = Exception  # type: ignore
+    ExpiredSignatureError = Exception  # type: ignore
+    _JOSE_OK = False
+
+_AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "").strip()
+_AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "").strip()
+_AUTH0_ISSUER = os.getenv("AUTH0_ISSUER", "").strip()
+_AUTH0_ALGOS = ["RS256"]
+
+_auth_bearer = HTTPBearer(auto_error=False)
+_jwks_cache: Dict[str, Any] = {"ts": 0.0, "jwks": None}
+_JWKS_TTL_SECONDS = 3600
+
+
+def _get_jwks() -> Dict[str, Any]:
+    if not _AUTH0_DOMAIN:
+        raise RuntimeError("Missing AUTH0_DOMAIN environment variable.")
+    now = time.time()
+    if _jwks_cache["jwks"] is not None and (now - float(_jwks_cache["ts"])) < _JWKS_TTL_SECONDS:
+        return _jwks_cache["jwks"]
+
+    url = f"https://{_AUTH0_DOMAIN}/.well-known/jwks.json"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    _jwks_cache["jwks"] = data
+    _jwks_cache["ts"] = now
+    return data
+
+
+def _get_rsa_key(token: str) -> Optional[Dict[str, Any]]:
+    if not _JOSE_OK or jwt is None:
+        return None
+    try:
+        headers = jwt.get_unverified_header(token)
+        kid = headers.get("kid")
+        if not kid:
+            return None
+        jwks = _get_jwks()
+        for key in jwks.get("keys", []):
+            if key.get("kid") == kid:
+                return key
+        return None
+    except Exception:
+        return None
+
+
+def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer)) -> Dict[str, Any]:
+    """FastAPI dependency: validates Auth0 JWT and returns decoded claims."""
+    if not _JOSE_OK or jwt is None:
+        raise HTTPException(status_code=500, detail="Auth dependencies not installed. Add python-jose[cryptography] to requirements.")
+    if not _AUTH0_AUDIENCE or not _AUTH0_ISSUER:
+        raise HTTPException(
+            status_code=500,
+            detail="Auth is not configured on the server (missing AUTH0_AUDIENCE/AUTH0_ISSUER)."
+        )
+
+    if credentials is None or (credentials.scheme or "").lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing Bearer token.")
+
+    token = credentials.credentials
+    rsa_key = _get_rsa_key(token)
+    if not rsa_key:
+        raise HTTPException(status_code=401, detail="Invalid token (no matching JWKS key).")
+
+    try:
+        decoded = jwt.decode(
+            token,
+            rsa_key,
+            algorithms=_AUTH0_ALGOS,
+            audience=_AUTH0_AUDIENCE,
+            issuer=_AUTH0_ISSUER,
+        )
+        return decoded
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired.")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
 # ---------------------------
 # Helpers
@@ -1349,7 +1448,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     raise RuntimeError(f"Gemini request failed: {last_err}")
 
 @router.post("/ai/interpret", response_model=ApiOut)
-def ai_interpret(payload: AIInterpretIn = Body(...)):
+def ai_interpret(payload: AIInterpretIn = Body(...), user_claims: Dict[str, Any] = Depends(require_auth)):
     # Server-side AI interpretation: build prompt in code, call Gemini, return text.
     try:
         y, warnings, freq = _prep_series(payload.series)

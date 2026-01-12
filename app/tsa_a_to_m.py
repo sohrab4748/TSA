@@ -178,9 +178,20 @@ def account_me(
             "sub": user_claims.get("sub"),
             "email": email,
             "email_verified": email_verified,
-            "plan": "free",
+            "plan": get_user_plan(email),
         },
     }
+
+_PAID_EMAILS = {
+    e.strip().lower()
+    for e in (os.getenv("PAID_EMAILS", "")).split(",")
+    if e.strip()
+}
+
+def get_user_plan(email: str | None) -> str:
+    if not email:
+        return "free"
+    return "pro" if email.strip().lower() in _PAID_EMAILS else "free"
 
 # ---------------------------
 # Helpers

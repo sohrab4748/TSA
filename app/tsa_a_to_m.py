@@ -62,6 +62,9 @@ except Exception:  # pragma: no cover
 _AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "").strip()
 _AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "").strip()
 _AUTH0_ISSUER = os.getenv("AUTH0_ISSUER", "").strip()
+# If AUTH0_ISSUER isn't set, derive it from AUTH0_DOMAIN (recommended by Auth0: https://<domain>/)
+if not _AUTH0_ISSUER and _AUTH0_DOMAIN:
+    _AUTH0_ISSUER = f"https://{_AUTH0_DOMAIN}/"
 _AUTH0_ALGOS = ["RS256"]
 
 _auth_bearer = HTTPBearer(auto_error=False)
@@ -105,10 +108,15 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
     """FastAPI dependency: validates Auth0 JWT and returns decoded claims."""
     if not _JOSE_OK or jwt is None:
         raise HTTPException(status_code=500, detail="Auth dependencies not installed. Add python-jose[cryptography] to requirements.")
-    if not _AUTH0_AUDIENCE or not _AUTH0_ISSUER:
+    if not _AUTH0_DOMAIN or not _AUTH0_AUDIENCE or not _AUTH0_ISSUER:
+        missing = []
+        if not _AUTH0_DOMAIN: missing.append("AUTH0_DOMAIN")
+        if not _AUTH0_AUDIENCE: missing.append("AUTH0_AUDIENCE")
+        if not _AUTH0_ISSUER: missing.append("AUTH0_ISSUER")
         raise HTTPException(
             status_code=500,
-            detail="Auth is not configured on the server (missing AUTH0_AUDIENCE/AUTH0_ISSUER)."
+            detail="Auth is not configured on the server (missing: " + ", ".join(missing) + "). "
+                   "Set these Render environment variables so the API can validate Auth0 JWTs."
         )
 
     if credentials is None or (credentials.scheme or "").lower() != "bearer":

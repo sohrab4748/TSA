@@ -1212,7 +1212,13 @@ def tsa_j_sarima(payload: SarimaIn):
 
 @router.post("/tsa/J_sarimax_forecast", response_model=ApiOut)
 def tsa_j_sarimax(payload: SarimaxIn):
-    """Seasonal ARIMA with exogenous regressors (SARIMAX)."""
+    """
+    Seasonal ARIMA with optional exogenous regressors (SARIMAX).
+
+    Notes:
+    - If exog_train is omitted, this behaves like SARIMA (no exogenous variables).
+    - If exog_train is provided, exog_future is optional; if omitted, we repeat the last train row.
+    """
     y, warnings, freq = _prep_series(payload.series)
     y_full = y
     y2 = y.dropna()
@@ -1222,7 +1228,6 @@ def tsa_j_sarimax(payload: SarimaxIn):
         warnings.append(f"SARIMAX: input series is long (n={int(y2.shape[0])}); fitting on last 2000 points for speed.")
         y2 = y2.iloc[-2000:]
 
-    n = int(y2.shape[0])
     h = int(max(1, int(_get_param_any(payload, "horizon", 12))))
 
     sp = _seasonal_period_from_inputs(freq, _get_param_any(payload, "seasonal_period", None))
@@ -1230,36 +1235,44 @@ def tsa_j_sarimax(payload: SarimaxIn):
         warnings.append("SARIMAX: seasonal_period is < 2 (or could not be inferred); fitting non-seasonal ARIMAX instead.")
         sp = 0
 
-    # Align exog_train to y2 (post-dropna)
-    exog_train = _align_exog_to_y(y_full, y.dropna(), payload.exog_train)
-    if exog_train is None:
-        raise HTTPException(
-            status_code=422,
-            detail="SARIMAX requires exog_train. Provide exog_train as [n x k] where n matches either full series length or the non-missing length.",
-        )
+    # Optional exogenous regressors
+    exog_train = None
+    ex_future = None
+    k = 0
 
-    # If we truncated y2 for speed, truncate exog_train to match
-    if exog_train.shape[0] != len(y.dropna()):
-        raise HTTPException(status_code=422, detail="Internal exog alignment error (train).")
-    if len(y.dropna()) > len(y2):
-        exog_train = exog_train[-len(y2):, :]
+    if payload.exog_train is not None:
+        # Align exog_train to y (post-dropna)
+        exog_train = _align_exog_to_y(y_full, y.dropna(), payload.exog_train)
+        if exog_train is None:
+            raise HTTPException(
+                status_code=422,
+                detail="SARIMAX: exog_train shape mismatch. Provide exog_train as [n x k] where n matches either full series length or the non-missing length.",
+            )
 
-    k = int(exog_train.shape[1]) if exog_train.ndim == 2 else 1
+        if exog_train.shape[0] != len(y.dropna()):
+            raise HTTPException(status_code=422, detail="SARIMAX: exog_train length must match the non-missing series length (after dropna) or the full series length.")
 
-    # Prepare future exog
-    exog_future = payload.exog_future
-    if exog_future is None:
-        warnings.append("SARIMAX: exog_future not provided; repeating the last exog_train row for the forecast horizon.")
-        last = exog_train[-1, :].reshape(1, k)
-        ex_future = np.repeat(last, h, axis=0)
+        # If we truncated y2 for speed, truncate exog_train to match
+        if len(y.dropna()) > len(y2):
+            exog_train = exog_train[-len(y2):, :]
+
+        k = int(exog_train.shape[1]) if exog_train.ndim == 2 else 1
+
+        # Prepare future exog
+        if payload.exog_future is None:
+            warnings.append("SARIMAX: exog_future not provided; repeating the last exog_train row for the forecast horizon.")
+            last = exog_train[-1, :].reshape(1, k)
+            ex_future = np.repeat(last, h, axis=0)
+        else:
+            ex_future = np.asarray(payload.exog_future, dtype="float64")
+            if ex_future.ndim == 1:
+                ex_future = ex_future.reshape(-1, 1)
+            if ex_future.shape[0] != h:
+                raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {h} rows (horizon), got {ex_future.shape[0]}.")
+            if ex_future.shape[1] != k:
+                raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {k} columns, got {ex_future.shape[1]}.")
     else:
-        ex_future = np.asarray(exog_future, dtype="float64")
-        if ex_future.ndim == 1:
-            ex_future = ex_future.reshape(-1, 1)
-        if ex_future.shape[0] != h:
-            raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {h} rows (horizon), got {ex_future.shape[0]}.")
-        if ex_future.shape[1] != k:
-            raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {k} columns, got {ex_future.shape[1]}.")
+        warnings.append("SARIMAX: exogenous regressors not provided; fitting SARIMA (no exog).")
 
     auto = bool(_get_param_any(payload, "auto", True))
 
@@ -1285,6 +1298,7 @@ def tsa_j_sarimax(payload: SarimaxIn):
         if sorder is None:
             sorder = (0, 0, 0, int(sp)) if sp >= 2 else (0, 0, 0, 0)
 
+    # Normalize seasonal order
     if (sp < 2) or (sorder is None) or (int(sorder[3]) < 2) or (int(sorder[0]) == 0 and int(sorder[1]) == 0 and int(sorder[2]) == 0):
         sorder = (0, 0, 0, 0)
 
@@ -1295,7 +1309,7 @@ def tsa_j_sarimax(payload: SarimaxIn):
 
         model = SARIMAX(
             y2,
-            exog=exog_train,
+            exog=exog_train if exog_train is not None else None,
             order=tuple(map(int, ord_)),
             seasonal_order=tuple(map(int, sord_)),
             enforce_stationarity=False,
@@ -1304,32 +1318,40 @@ def tsa_j_sarimax(payload: SarimaxIn):
             low_memory=True,
         )
         res = model.fit(disp=False, maxiter=100)
-        fc = res.get_forecast(steps=h, exog=ex_future)
+
+        if exog_train is not None:
+            fc = res.get_forecast(steps=h, exog=ex_future)
+        else:
+            fc = res.get_forecast(steps=h)
+
         mean = fc.predicted_mean
         ci = fc.conf_int(alpha=0.05)
         return res, mean, ci
 
     try:
         res, mean, ci = fit_and_forecast(order, sorder)
-
         x_fc = _forecast_index(y2, h)
 
         # Exog names
         names = payload.exog_names
-        if not names or len(names) != k:
-            names = [f"x{i+1}" for i in range(k)]
+        if exog_train is None:
+            names = []
+        else:
+            if not names or len(names) != k:
+                names = [f"x{i+1}" for i in range(k)]
 
         exog_params = {}
-        try:
-            # SARIMAX params includes AR/MA and exog; extract by name when possible
-            for nm in names:
-                if nm in res.params.index:
-                    exog_params[nm] = safe_float(res.params[nm])
-        except Exception:
-            pass
+        if exog_train is not None:
+            try:
+                for nm in names:
+                    if nm in res.params.index:
+                        exog_params[nm] = safe_float(res.params[nm])
+            except Exception:
+                pass
 
         result = {
             "model": "SARIMAX",
+            "has_exog": bool(exog_train is not None),
             "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
             "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
             "aic": safe_float(res.aic),

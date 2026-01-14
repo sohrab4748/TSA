@@ -1021,6 +1021,333 @@ def tsa_j_arima(payload: ForecastIn):
 
 
 
+
+# ---------------------------
+# J2) SARIMA / SARIMAX forecast (seasonal ARIMA and seasonal ARIMA with exogenous regressors)
+# ---------------------------
+
+class SarimaIn(BaseModel):
+    series: SeriesIn
+    horizon: int = Field(default=12, ge=1)
+    auto: bool = Field(default=True)
+
+    # Manual orders (used when auto=False)
+    order: Optional[Tuple[int, int, int]] = None                 # (p, d, q)
+    seasonal_order: Optional[Tuple[int, int, int, int]] = None   # (P, D, Q, s)
+
+    # Seasonal period helper (s). If None, inferred from frequency.
+    seasonal_period: Optional[int] = None
+
+    # Auto-search bounds (kept small for Render/free CPU)
+    max_p: int = 3
+    max_d: int = 1
+    max_q: int = 3
+    max_P: int = 1
+    max_D: int = 1
+    max_Q: int = 1
+
+    # Optional bag for future UI extensions
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SarimaxIn(SarimaIn):
+    # Exogenous regressors (X). Provide either:
+    # - exog_train length == len(y_used_after_dropna)
+    # - OR exog_train length == len(y_full) (we will subset to match y_used)
+    exog_train: Optional[List[List[float]]] = None
+    # Future exogenous values for the forecast horizon (h x k). If omitted, we repeat the last train row.
+    exog_future: Optional[List[List[float]]] = None
+    exog_names: Optional[List[str]] = None
+
+
+def _get_param_any(payload, name: str, default):
+    v = getattr(payload, name, None)
+    if v is not None:
+        return v
+    if hasattr(payload, "params") and isinstance(payload.params, dict) and name in payload.params:
+        return payload.params.get(name, default)
+    return default
+
+
+def _coerce_order(x: Any, n: int) -> Optional[tuple]:
+    """Accept order as tuple/list of length n OR dict with keys."""
+    if x is None:
+        return None
+    if isinstance(x, (list, tuple)) and len(x) == n:
+        try:
+            return tuple(int(v) for v in x)
+        except Exception:
+            return None
+    if isinstance(x, dict):
+        keys = ["p", "d", "q"] if n == 3 else ["P", "D", "Q", "s"]
+        if all(k in x for k in keys):
+            try:
+                return tuple(int(x[k]) for k in keys)
+            except Exception:
+                return None
+    return None
+
+
+def _align_exog_to_y(y_full: pd.Series, y_used: pd.Series, exog: Optional[List[List[float]]]) -> Optional[np.ndarray]:
+    """Align exog rows to match the dropped-NA series used for fitting."""
+    if exog is None:
+        return None
+    ex = np.asarray(exog, dtype="float64")
+    if ex.ndim == 1:
+        ex = ex.reshape(-1, 1)
+
+    if ex.shape[0] == len(y_used):
+        return ex
+
+    if ex.shape[0] == len(y_full):
+        mask = pd.to_numeric(y_full, errors="coerce").replace([np.inf, -np.inf], np.nan).notna().values
+        try:
+            return ex[mask]
+        except Exception:
+            return None
+
+    return None
+
+
+@router.post("/tsa/J_sarima_forecast", response_model=ApiOut)
+def tsa_j_sarima(payload: SarimaIn):
+    """Seasonal ARIMA (SARIMA) forecast. Uses SARIMAX under the hood (no exog)."""
+    y, warnings, freq = _prep_series(payload.series)
+    y_full = y
+    y2 = y.dropna()
+
+    # Speed guard
+    if y2.shape[0] > 2000:
+        warnings.append(f"SARIMA: input series is long (n={int(y2.shape[0])}); fitting on last 2000 points for speed.")
+        y2 = y2.iloc[-2000:]
+
+    n = int(y2.shape[0])
+    h = int(max(1, int(_get_param_any(payload, "horizon", 12))))
+
+    sp = _seasonal_period_from_inputs(freq, _get_param_any(payload, "seasonal_period", None))
+    if sp < 2:
+        warnings.append("SARIMA: seasonal_period is < 2 (or could not be inferred); fitting non-seasonal ARIMA instead.")
+        sp = 0
+
+    auto = bool(_get_param_any(payload, "auto", True))
+
+    if auto:
+        order, sorder, w = _fit_arima_grid(
+            y2,
+            seasonal_period=sp,
+            seasonal=(sp >= 2),
+            max_p=int(_get_param_any(payload, "max_p", 3)),
+            max_d=int(_get_param_any(payload, "max_d", 1)),
+            max_q=int(_get_param_any(payload, "max_q", 3)),
+            max_P=int(_get_param_any(payload, "max_P", 1)),
+            max_D=int(_get_param_any(payload, "max_D", 1)),
+            max_Q=int(_get_param_any(payload, "max_Q", 1)),
+        )
+        warnings += w
+    else:
+        order = _coerce_order(_get_param_any(payload, "order", None), 3)
+        sorder = _coerce_order(_get_param_any(payload, "seasonal_order", None), 4)
+
+        if order is None:
+            raise HTTPException(status_code=422, detail="SARIMA manual mode: provide 'order' as (p,d,q) or {p,d,q}.")
+        if sorder is None:
+            # default seasonal if sp is available, otherwise no seasonal
+            sorder = (0, 0, 0, int(sp)) if sp >= 2 else (0, 0, 0, 0)
+
+    # Normalize seasonal order
+    if (sp < 2) or (sorder is None) or (int(sorder[3]) < 2) or (int(sorder[0]) == 0 and int(sorder[1]) == 0 and int(sorder[2]) == 0):
+        sorder = (0, 0, 0, 0)
+
+    def fit_and_forecast(ord_, sord_):
+        d = int(ord_[1])
+        D = int(sord_[1]) if sord_ else 0
+        simple_diff = (d > 0) or (D > 0)
+
+        model = SARIMAX(
+            y2,
+            order=tuple(map(int, ord_)),
+            seasonal_order=tuple(map(int, sord_)),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            simple_differencing=simple_diff,
+            low_memory=True,
+        )
+        res = model.fit(disp=False, maxiter=80)
+        fc = res.get_forecast(steps=h)
+        mean = fc.predicted_mean
+        ci = fc.conf_int(alpha=0.05)
+        return res, mean, ci
+
+    try:
+        res, mean, ci = fit_and_forecast(order, sorder)
+
+        # Explosion guard
+        y_scale = float(np.nanmax(np.abs(y2.values))) if n > 0 else 1.0
+        y_scale = max(y_scale, 1e-9)
+        mmax = float(np.nanmax(np.abs(mean.values))) if len(mean.values) else 0.0
+        if (not np.isfinite(mmax)) or (mmax / y_scale > 1e6):
+            warnings.append("SARIMA forecast magnitude exploded (unstable fit). Falling back to ARIMA(0,1,0).")
+            order = (0, 1, 0)
+            sorder = (0, 0, 0, 0)
+            res, mean, ci = fit_and_forecast(order, sorder)
+
+        x_fc = _forecast_index(y2, h)
+
+        result = {
+            "model": "SARIMA",
+            "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
+            "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
+            "aic": safe_float(res.aic),
+            "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+            "conf_int_95": {
+                "lower": _as_float_list(ci.iloc[:, 0].values),
+                "upper": _as_float_list(ci.iloc[:, 1].values),
+            },
+        }
+        return ApiOut(ok=True, result=result, warnings=warnings)
+
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"SARIMA fit/forecast failed: {str(e)}"}, warnings=warnings)
+
+
+@router.post("/tsa/J_sarimax_forecast", response_model=ApiOut)
+def tsa_j_sarimax(payload: SarimaxIn):
+    """Seasonal ARIMA with exogenous regressors (SARIMAX)."""
+    y, warnings, freq = _prep_series(payload.series)
+    y_full = y
+    y2 = y.dropna()
+
+    # Speed guard
+    if y2.shape[0] > 2000:
+        warnings.append(f"SARIMAX: input series is long (n={int(y2.shape[0])}); fitting on last 2000 points for speed.")
+        y2 = y2.iloc[-2000:]
+
+    n = int(y2.shape[0])
+    h = int(max(1, int(_get_param_any(payload, "horizon", 12))))
+
+    sp = _seasonal_period_from_inputs(freq, _get_param_any(payload, "seasonal_period", None))
+    if sp < 2:
+        warnings.append("SARIMAX: seasonal_period is < 2 (or could not be inferred); fitting non-seasonal ARIMAX instead.")
+        sp = 0
+
+    # Align exog_train to y2 (post-dropna)
+    exog_train = _align_exog_to_y(y_full, y.dropna(), payload.exog_train)
+    if exog_train is None:
+        raise HTTPException(
+            status_code=422,
+            detail="SARIMAX requires exog_train. Provide exog_train as [n x k] where n matches either full series length or the non-missing length.",
+        )
+
+    # If we truncated y2 for speed, truncate exog_train to match
+    if exog_train.shape[0] != len(y.dropna()):
+        raise HTTPException(status_code=422, detail="Internal exog alignment error (train).")
+    if len(y.dropna()) > len(y2):
+        exog_train = exog_train[-len(y2):, :]
+
+    k = int(exog_train.shape[1]) if exog_train.ndim == 2 else 1
+
+    # Prepare future exog
+    exog_future = payload.exog_future
+    if exog_future is None:
+        warnings.append("SARIMAX: exog_future not provided; repeating the last exog_train row for the forecast horizon.")
+        last = exog_train[-1, :].reshape(1, k)
+        ex_future = np.repeat(last, h, axis=0)
+    else:
+        ex_future = np.asarray(exog_future, dtype="float64")
+        if ex_future.ndim == 1:
+            ex_future = ex_future.reshape(-1, 1)
+        if ex_future.shape[0] != h:
+            raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {h} rows (horizon), got {ex_future.shape[0]}.")
+        if ex_future.shape[1] != k:
+            raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {k} columns, got {ex_future.shape[1]}.")
+
+    auto = bool(_get_param_any(payload, "auto", True))
+
+    if auto:
+        order, sorder, w = _fit_arima_grid(
+            y2,
+            seasonal_period=sp,
+            seasonal=(sp >= 2),
+            max_p=int(_get_param_any(payload, "max_p", 3)),
+            max_d=int(_get_param_any(payload, "max_d", 1)),
+            max_q=int(_get_param_any(payload, "max_q", 3)),
+            max_P=int(_get_param_any(payload, "max_P", 1)),
+            max_D=int(_get_param_any(payload, "max_D", 1)),
+            max_Q=int(_get_param_any(payload, "max_Q", 1)),
+        )
+        warnings += w
+    else:
+        order = _coerce_order(_get_param_any(payload, "order", None), 3)
+        sorder = _coerce_order(_get_param_any(payload, "seasonal_order", None), 4)
+
+        if order is None:
+            raise HTTPException(status_code=422, detail="SARIMAX manual mode: provide 'order' as (p,d,q) or {p,d,q}.")
+        if sorder is None:
+            sorder = (0, 0, 0, int(sp)) if sp >= 2 else (0, 0, 0, 0)
+
+    if (sp < 2) or (sorder is None) or (int(sorder[3]) < 2) or (int(sorder[0]) == 0 and int(sorder[1]) == 0 and int(sorder[2]) == 0):
+        sorder = (0, 0, 0, 0)
+
+    def fit_and_forecast(ord_, sord_):
+        d = int(ord_[1])
+        D = int(sord_[1]) if sord_ else 0
+        simple_diff = (d > 0) or (D > 0)
+
+        model = SARIMAX(
+            y2,
+            exog=exog_train,
+            order=tuple(map(int, ord_)),
+            seasonal_order=tuple(map(int, sord_)),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            simple_differencing=simple_diff,
+            low_memory=True,
+        )
+        res = model.fit(disp=False, maxiter=100)
+        fc = res.get_forecast(steps=h, exog=ex_future)
+        mean = fc.predicted_mean
+        ci = fc.conf_int(alpha=0.05)
+        return res, mean, ci
+
+    try:
+        res, mean, ci = fit_and_forecast(order, sorder)
+
+        x_fc = _forecast_index(y2, h)
+
+        # Exog names
+        names = payload.exog_names
+        if not names or len(names) != k:
+            names = [f"x{i+1}" for i in range(k)]
+
+        exog_params = {}
+        try:
+            # SARIMAX params includes AR/MA and exog; extract by name when possible
+            for nm in names:
+                if nm in res.params.index:
+                    exog_params[nm] = safe_float(res.params[nm])
+        except Exception:
+            pass
+
+        result = {
+            "model": "SARIMAX",
+            "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
+            "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
+            "aic": safe_float(res.aic),
+            "exog_names": names,
+            "exog_params": exog_params,
+            "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+            "conf_int_95": {
+                "lower": _as_float_list(ci.iloc[:, 0].values),
+                "upper": _as_float_list(ci.iloc[:, 1].values),
+            },
+        }
+        return ApiOut(ok=True, result=result, warnings=warnings)
+
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"SARIMAX fit/forecast failed: {str(e)}"}, warnings=warnings)
+
+
+
 # ---------------------------
 # K) ETS (Exponential Smoothing) forecast
 # ---------------------------

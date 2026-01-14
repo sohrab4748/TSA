@@ -61,6 +61,11 @@ except Exception:  # pragma: no cover
     ExpiredSignatureError = Exception  # type: ignore
     _JOSE_OK = False
 
+
+# AI generation controls (tunable via Render environment variables)
+AI_MAX_OUTPUT_TOKENS = int(os.getenv('AI_MAX_OUTPUT_TOKENS', '4096'))
+AI_CONTINUE_MAX = int(os.getenv('AI_CONTINUE_MAX', '2'))
+
 _AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "").strip()
 _AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "").strip()
 _AUTH0_ISSUER = os.getenv("AUTH0_ISSUER", "").strip()
@@ -1427,7 +1432,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                max_output_tokens=1600,
+                max_output_tokens=AI_MAX_OUTPUT_TOKENS,
             ),
         )
 
@@ -1465,7 +1470,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     body = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1600},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": AI_MAX_OUTPUT_TOKENS},
     }
 
     req = urllib.request.Request(
@@ -1552,29 +1557,54 @@ def ai_interpret(
         def _needs_continue(t: str) -> bool:
             if not t:
                 return True
-            t_low = t.lower()
-            # Expect at least sections 1,2,3 or an explicit 'next steps' section.
-            has2 = ('### 2' in t_low) or ('## 2' in t_low) or ('2)' in t_low)
-            has3 = ('### 3' in t_low) or ('## 3' in t_low) or ('3)' in t_low) or ('next steps' in t_low)
-            # Also treat a mid-sentence ending as incomplete.
-            ends_ok = t.strip().endswith(('.', '!', '?', ':'))
-            too_short = len(t.strip()) < 400
-            return (not (has2 and has3)) or (too_short and not ends_ok)
+            t_strip = t.strip()
+            if len(t_strip) < 500:
+                return True
 
-        if _needs_continue(text):
-            tail = text[-1200:] if text else ''
+            # If the output ends on a markdown heading line (e.g., '#### 3.2 Autocorrelation'),
+            # it is very likely truncated.
+            last_line = ""
+            for ln in reversed(t_strip.splitlines()):
+                ln = ln.strip()
+                if ln:
+                    last_line = ln
+                    break
+            if last_line.startswith("#"):
+                return True
+
+            # If the last character is not a typical sentence terminator, treat as incomplete.
+            good_end = (".", "!", "?", ")", "]", "”", '"', "'", "…")
+            if not t_strip.endswith(good_end):
+                return True
+
+            return False
+
+
+        # If the model truncates the output (common when the report is long), ask it to continue.
+        for _ in range(max(0, AI_CONTINUE_MAX)):
+            if not _needs_continue(text):
+                break
+            tail = text[-1400:] if text else ""
             user2 = (
-                'Continue the interpretation from where you stopped.\n'
-                'Do NOT repeat section 1. Provide sections 2 and 3 clearly.\n\n'
-                'Previous text (tail):\n' + tail + '\n\n'
-                'Context (same JSON, abbreviated):\n' + json.dumps(compact, ensure_ascii=False, separators=(",",":"), default=str) + '\n'
+                "Continue the interpretation from where you stopped.\n"
+                "Do NOT repeat earlier content. Continue from the last heading/paragraph.\n"
+                "Keep the same style and numbering.\n\n"
+                "Previous text (tail):\n" + tail + "\n\n"
+                "Context (same JSON, abbreviated):\n"
+                + json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)
+                + "\n"
             )
             try:
                 text2 = _call_gemini_text(system, user2, model=model)
-                if text2 and text2.strip() and text2.strip() not in text:
-                    text = (text.rstrip() + '\n\n' + text2.strip()).strip()
             except Exception:
-                pass
+                break
+            if not text2 or not text2.strip():
+                break
+            t2 = text2.strip()
+            if t2 in text:
+                break
+            text = (text.rstrip() + "\n\n" + t2).strip()
+
         result = {"text": text, "model": model, "style": payload.style}
 
         if payload.debug:

@@ -61,11 +61,6 @@ except Exception:  # pragma: no cover
     ExpiredSignatureError = Exception  # type: ignore
     _JOSE_OK = False
 
-
-# AI generation controls (tunable via Render environment variables)
-AI_MAX_OUTPUT_TOKENS = int(os.getenv('AI_MAX_OUTPUT_TOKENS', '4096'))
-AI_CONTINUE_MAX = int(os.getenv('AI_CONTINUE_MAX', '2'))
-
 _AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "").strip()
 _AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "").strip()
 _AUTH0_ISSUER = os.getenv("AUTH0_ISSUER", "").strip()
@@ -1021,355 +1016,6 @@ def tsa_j_arima(payload: ForecastIn):
 
 
 
-
-# ---------------------------
-# J2) SARIMA / SARIMAX forecast (seasonal ARIMA and seasonal ARIMA with exogenous regressors)
-# ---------------------------
-
-class SarimaIn(BaseModel):
-    series: SeriesIn
-    horizon: int = Field(default=12, ge=1)
-    auto: bool = Field(default=True)
-
-    # Manual orders (used when auto=False)
-    order: Optional[Tuple[int, int, int]] = None                 # (p, d, q)
-    seasonal_order: Optional[Tuple[int, int, int, int]] = None   # (P, D, Q, s)
-
-    # Seasonal period helper (s). If None, inferred from frequency.
-    seasonal_period: Optional[int] = None
-
-    # Auto-search bounds (kept small for Render/free CPU)
-    max_p: int = 3
-    max_d: int = 1
-    max_q: int = 3
-    max_P: int = 1
-    max_D: int = 1
-    max_Q: int = 1
-
-    # Optional bag for future UI extensions
-    params: Dict[str, Any] = Field(default_factory=dict)
-
-
-class SarimaxIn(SarimaIn):
-    # Exogenous regressors (X). Provide either:
-    # - exog_train length == len(y_used_after_dropna)
-    # - OR exog_train length == len(y_full) (we will subset to match y_used)
-    exog_train: Optional[List[List[float]]] = None
-    # Future exogenous values for the forecast horizon (h x k). If omitted, we repeat the last train row.
-    exog_future: Optional[List[List[float]]] = None
-    exog_names: Optional[List[str]] = None
-
-
-def _get_param_any(payload, name: str, default):
-    v = getattr(payload, name, None)
-    if v is not None:
-        return v
-    if hasattr(payload, "params") and isinstance(payload.params, dict) and name in payload.params:
-        return payload.params.get(name, default)
-    return default
-
-
-def _coerce_order(x: Any, n: int) -> Optional[tuple]:
-    """Accept order as tuple/list of length n OR dict with keys."""
-    if x is None:
-        return None
-    if isinstance(x, (list, tuple)) and len(x) == n:
-        try:
-            return tuple(int(v) for v in x)
-        except Exception:
-            return None
-    if isinstance(x, dict):
-        keys = ["p", "d", "q"] if n == 3 else ["P", "D", "Q", "s"]
-        if all(k in x for k in keys):
-            try:
-                return tuple(int(x[k]) for k in keys)
-            except Exception:
-                return None
-    return None
-
-
-def _align_exog_to_y(y_full: pd.Series, y_used: pd.Series, exog: Optional[List[List[float]]]) -> Optional[np.ndarray]:
-    """Align exog rows to match the dropped-NA series used for fitting."""
-    if exog is None:
-        return None
-    ex = np.asarray(exog, dtype="float64")
-    if ex.ndim == 1:
-        ex = ex.reshape(-1, 1)
-
-    if ex.shape[0] == len(y_used):
-        return ex
-
-    if ex.shape[0] == len(y_full):
-        mask = pd.to_numeric(y_full, errors="coerce").replace([np.inf, -np.inf], np.nan).notna().values
-        try:
-            return ex[mask]
-        except Exception:
-            return None
-
-    return None
-
-
-@router.post("/tsa/J_sarima_forecast", response_model=ApiOut)
-def tsa_j_sarima(payload: SarimaIn):
-    """Seasonal ARIMA (SARIMA) forecast. Uses SARIMAX under the hood (no exog)."""
-    y, warnings, freq = _prep_series(payload.series)
-    y_full = y
-    y2 = y.dropna()
-
-    # Speed guard
-    if y2.shape[0] > 2000:
-        warnings.append(f"SARIMA: input series is long (n={int(y2.shape[0])}); fitting on last 2000 points for speed.")
-        y2 = y2.iloc[-2000:]
-
-    n = int(y2.shape[0])
-    h = int(max(1, int(_get_param_any(payload, "horizon", 12))))
-
-    sp = _seasonal_period_from_inputs(freq, _get_param_any(payload, "seasonal_period", None))
-    if sp < 2:
-        warnings.append("SARIMA: seasonal_period is < 2 (or could not be inferred); fitting non-seasonal ARIMA instead.")
-        sp = 0
-
-    auto = bool(_get_param_any(payload, "auto", True))
-
-    if auto:
-        order, sorder, w = _fit_arima_grid(
-            y2,
-            seasonal_period=sp,
-            seasonal=(sp >= 2),
-            max_p=int(_get_param_any(payload, "max_p", 3)),
-            max_d=int(_get_param_any(payload, "max_d", 1)),
-            max_q=int(_get_param_any(payload, "max_q", 3)),
-            max_P=int(_get_param_any(payload, "max_P", 1)),
-            max_D=int(_get_param_any(payload, "max_D", 1)),
-            max_Q=int(_get_param_any(payload, "max_Q", 1)),
-        )
-        warnings += w
-    else:
-        order = _coerce_order(_get_param_any(payload, "order", None), 3)
-        sorder = _coerce_order(_get_param_any(payload, "seasonal_order", None), 4)
-
-        if order is None:
-            raise HTTPException(status_code=422, detail="SARIMA manual mode: provide 'order' as (p,d,q) or {p,d,q}.")
-        if sorder is None:
-            # default seasonal if sp is available, otherwise no seasonal
-            sorder = (0, 0, 0, int(sp)) if sp >= 2 else (0, 0, 0, 0)
-
-    # Normalize seasonal order
-    if (sp < 2) or (sorder is None) or (int(sorder[3]) < 2) or (int(sorder[0]) == 0 and int(sorder[1]) == 0 and int(sorder[2]) == 0):
-        sorder = (0, 0, 0, 0)
-
-    def fit_and_forecast(ord_, sord_):
-        d = int(ord_[1])
-        D = int(sord_[1]) if sord_ else 0
-        simple_diff = (d > 0) or (D > 0)
-
-        model = SARIMAX(
-            y2,
-            order=tuple(map(int, ord_)),
-            seasonal_order=tuple(map(int, sord_)),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-            simple_differencing=simple_diff,
-            low_memory=True,
-        )
-        res = model.fit(disp=False, maxiter=80)
-        fc = res.get_forecast(steps=h)
-        mean = fc.predicted_mean
-        ci = fc.conf_int(alpha=0.05)
-        return res, mean, ci
-
-    try:
-        res, mean, ci = fit_and_forecast(order, sorder)
-
-        # Explosion guard
-        y_scale = float(np.nanmax(np.abs(y2.values))) if n > 0 else 1.0
-        y_scale = max(y_scale, 1e-9)
-        mmax = float(np.nanmax(np.abs(mean.values))) if len(mean.values) else 0.0
-        if (not np.isfinite(mmax)) or (mmax / y_scale > 1e6):
-            warnings.append("SARIMA forecast magnitude exploded (unstable fit). Falling back to ARIMA(0,1,0).")
-            order = (0, 1, 0)
-            sorder = (0, 0, 0, 0)
-            res, mean, ci = fit_and_forecast(order, sorder)
-
-        x_fc = _forecast_index(y2, h)
-
-        result = {
-            "model": "SARIMA",
-            "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
-            "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
-            "aic": safe_float(res.aic),
-            "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
-            "conf_int_95": {
-                "lower": _as_float_list(ci.iloc[:, 0].values),
-                "upper": _as_float_list(ci.iloc[:, 1].values),
-            },
-        }
-        return ApiOut(ok=True, result=result, warnings=warnings)
-
-    except Exception as e:
-        return ApiOut(ok=False, result={"error": f"SARIMA fit/forecast failed: {str(e)}"}, warnings=warnings)
-
-
-@router.post("/tsa/J_sarimax_forecast", response_model=ApiOut)
-def tsa_j_sarimax(payload: SarimaxIn):
-    """
-    Seasonal ARIMA with optional exogenous regressors (SARIMAX).
-
-    Notes:
-    - If exog_train is omitted, this behaves like SARIMA (no exogenous variables).
-    - If exog_train is provided, exog_future is optional; if omitted, we repeat the last train row.
-    """
-    y, warnings, freq = _prep_series(payload.series)
-    y_full = y
-    y2 = y.dropna()
-
-    # Speed guard
-    if y2.shape[0] > 2000:
-        warnings.append(f"SARIMAX: input series is long (n={int(y2.shape[0])}); fitting on last 2000 points for speed.")
-        y2 = y2.iloc[-2000:]
-
-    h = int(max(1, int(_get_param_any(payload, "horizon", 12))))
-
-    sp = _seasonal_period_from_inputs(freq, _get_param_any(payload, "seasonal_period", None))
-    if sp < 2:
-        warnings.append("SARIMAX: seasonal_period is < 2 (or could not be inferred); fitting non-seasonal ARIMAX instead.")
-        sp = 0
-
-    # Optional exogenous regressors
-    exog_train = None
-    ex_future = None
-    k = 0
-
-    if payload.exog_train is not None:
-        # Align exog_train to y (post-dropna)
-        exog_train = _align_exog_to_y(y_full, y.dropna(), payload.exog_train)
-        if exog_train is None:
-            raise HTTPException(
-                status_code=422,
-                detail="SARIMAX: exog_train shape mismatch. Provide exog_train as [n x k] where n matches either full series length or the non-missing length.",
-            )
-
-        if exog_train.shape[0] != len(y.dropna()):
-            raise HTTPException(status_code=422, detail="SARIMAX: exog_train length must match the non-missing series length (after dropna) or the full series length.")
-
-        # If we truncated y2 for speed, truncate exog_train to match
-        if len(y.dropna()) > len(y2):
-            exog_train = exog_train[-len(y2):, :]
-
-        k = int(exog_train.shape[1]) if exog_train.ndim == 2 else 1
-
-        # Prepare future exog
-        if payload.exog_future is None:
-            warnings.append("SARIMAX: exog_future not provided; repeating the last exog_train row for the forecast horizon.")
-            last = exog_train[-1, :].reshape(1, k)
-            ex_future = np.repeat(last, h, axis=0)
-        else:
-            ex_future = np.asarray(payload.exog_future, dtype="float64")
-            if ex_future.ndim == 1:
-                ex_future = ex_future.reshape(-1, 1)
-            if ex_future.shape[0] != h:
-                raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {h} rows (horizon), got {ex_future.shape[0]}.")
-            if ex_future.shape[1] != k:
-                raise HTTPException(status_code=422, detail=f"SARIMAX: exog_future must have {k} columns, got {ex_future.shape[1]}.")
-    else:
-        warnings.append("SARIMAX: exogenous regressors not provided; fitting SARIMA (no exog).")
-
-    auto = bool(_get_param_any(payload, "auto", True))
-
-    if auto:
-        order, sorder, w = _fit_arima_grid(
-            y2,
-            seasonal_period=sp,
-            seasonal=(sp >= 2),
-            max_p=int(_get_param_any(payload, "max_p", 3)),
-            max_d=int(_get_param_any(payload, "max_d", 1)),
-            max_q=int(_get_param_any(payload, "max_q", 3)),
-            max_P=int(_get_param_any(payload, "max_P", 1)),
-            max_D=int(_get_param_any(payload, "max_D", 1)),
-            max_Q=int(_get_param_any(payload, "max_Q", 1)),
-        )
-        warnings += w
-    else:
-        order = _coerce_order(_get_param_any(payload, "order", None), 3)
-        sorder = _coerce_order(_get_param_any(payload, "seasonal_order", None), 4)
-
-        if order is None:
-            raise HTTPException(status_code=422, detail="SARIMAX manual mode: provide 'order' as (p,d,q) or {p,d,q}.")
-        if sorder is None:
-            sorder = (0, 0, 0, int(sp)) if sp >= 2 else (0, 0, 0, 0)
-
-    # Normalize seasonal order
-    if (sp < 2) or (sorder is None) or (int(sorder[3]) < 2) or (int(sorder[0]) == 0 and int(sorder[1]) == 0 and int(sorder[2]) == 0):
-        sorder = (0, 0, 0, 0)
-
-    def fit_and_forecast(ord_, sord_):
-        d = int(ord_[1])
-        D = int(sord_[1]) if sord_ else 0
-        simple_diff = (d > 0) or (D > 0)
-
-        model = SARIMAX(
-            y2,
-            exog=exog_train if exog_train is not None else None,
-            order=tuple(map(int, ord_)),
-            seasonal_order=tuple(map(int, sord_)),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-            simple_differencing=simple_diff,
-            low_memory=True,
-        )
-        res = model.fit(disp=False, maxiter=100)
-
-        if exog_train is not None:
-            fc = res.get_forecast(steps=h, exog=ex_future)
-        else:
-            fc = res.get_forecast(steps=h)
-
-        mean = fc.predicted_mean
-        ci = fc.conf_int(alpha=0.05)
-        return res, mean, ci
-
-    try:
-        res, mean, ci = fit_and_forecast(order, sorder)
-        x_fc = _forecast_index(y2, h)
-
-        # Exog names
-        names = payload.exog_names
-        if exog_train is None:
-            names = []
-        else:
-            if not names or len(names) != k:
-                names = [f"x{i+1}" for i in range(k)]
-
-        exog_params = {}
-        if exog_train is not None:
-            try:
-                for nm in names:
-                    if nm in res.params.index:
-                        exog_params[nm] = safe_float(res.params[nm])
-            except Exception:
-                pass
-
-        result = {
-            "model": "SARIMAX",
-            "has_exog": bool(exog_train is not None),
-            "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
-            "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
-            "aic": safe_float(res.aic),
-            "exog_names": names,
-            "exog_params": exog_params,
-            "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
-            "conf_int_95": {
-                "lower": _as_float_list(ci.iloc[:, 0].values),
-                "upper": _as_float_list(ci.iloc[:, 1].values),
-            },
-        }
-        return ApiOut(ok=True, result=result, warnings=warnings)
-
-    except Exception as e:
-        return ApiOut(ok=False, result={"error": f"SARIMAX fit/forecast failed: {str(e)}"}, warnings=warnings)
-
-
-
 # ---------------------------
 # K) ETS (Exponential Smoothing) forecast
 # ---------------------------
@@ -1781,7 +1427,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                max_output_tokens=AI_MAX_OUTPUT_TOKENS,
+                max_output_tokens=1600,
             ),
         )
 
@@ -1819,7 +1465,7 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     body = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": AI_MAX_OUTPUT_TOKENS},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1600},
     }
 
     req = urllib.request.Request(
@@ -1871,32 +1517,9 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     raise RuntimeError(f"Gemini request failed: {last_err}")
 
 @router.post("/ai/interpret", response_model=ApiOut)
-def ai_interpret(
-    payload: AIInterpretIn = Body(...),
-    user_claims: Dict[str, Any] = Depends(require_auth),
-    creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer),
-):
+def ai_interpret(payload: AIInterpretIn = Body(...), user_claims: Dict[str, Any] = Depends(require_auth)):
     # Server-side AI interpretation: build prompt in code, call Gemini, return text.
     try:
-        # Resolve user email (access token may not include it). We fetch from Auth0 /userinfo if needed.
-        token = creds.credentials if creds else None
-        email = user_claims.get("email")
-        if token and not email:
-            try:
-                req = urllib.request.Request(
-                    f"https://{_AUTH0_DOMAIN}/userinfo",
-                    headers={"Authorization": f"Bearer {token}"},
-                    method="GET",
-                )
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    u = json.loads(r.read().decode("utf-8"))
-                email = u.get("email")
-            except Exception:
-                email = None
-
-        # Enforce plan: Pro users only
-        require_pro(email)
-
         y, warnings, freq = _prep_series(payload.series)
         system, user, compact = _build_ai_prompt(payload, y, freq, warnings)
         model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
@@ -1906,54 +1529,29 @@ def ai_interpret(
         def _needs_continue(t: str) -> bool:
             if not t:
                 return True
-            t_strip = t.strip()
-            if len(t_strip) < 500:
-                return True
+            t_low = t.lower()
+            # Expect at least sections 1,2,3 or an explicit 'next steps' section.
+            has2 = ('### 2' in t_low) or ('## 2' in t_low) or ('2)' in t_low)
+            has3 = ('### 3' in t_low) or ('## 3' in t_low) or ('3)' in t_low) or ('next steps' in t_low)
+            # Also treat a mid-sentence ending as incomplete.
+            ends_ok = t.strip().endswith(('.', '!', '?', ':'))
+            too_short = len(t.strip()) < 400
+            return (not (has2 and has3)) or (too_short and not ends_ok)
 
-            # If the output ends on a markdown heading line (e.g., '#### 3.2 Autocorrelation'),
-            # it is very likely truncated.
-            last_line = ""
-            for ln in reversed(t_strip.splitlines()):
-                ln = ln.strip()
-                if ln:
-                    last_line = ln
-                    break
-            if last_line.startswith("#"):
-                return True
-
-            # If the last character is not a typical sentence terminator, treat as incomplete.
-            good_end = (".", "!", "?", ")", "]", "”", '"', "'", "…")
-            if not t_strip.endswith(good_end):
-                return True
-
-            return False
-
-
-        # If the model truncates the output (common when the report is long), ask it to continue.
-        for _ in range(max(0, AI_CONTINUE_MAX)):
-            if not _needs_continue(text):
-                break
-            tail = text[-1400:] if text else ""
+        if _needs_continue(text):
+            tail = text[-1200:] if text else ''
             user2 = (
-                "Continue the interpretation from where you stopped.\n"
-                "Do NOT repeat earlier content. Continue from the last heading/paragraph.\n"
-                "Keep the same style and numbering.\n\n"
-                "Previous text (tail):\n" + tail + "\n\n"
-                "Context (same JSON, abbreviated):\n"
-                + json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)
-                + "\n"
+                'Continue the interpretation from where you stopped.\n'
+                'Do NOT repeat section 1. Provide sections 2 and 3 clearly.\n\n'
+                'Previous text (tail):\n' + tail + '\n\n'
+                'Context (same JSON, abbreviated):\n' + json.dumps(compact, ensure_ascii=False, separators=(",",":"), default=str) + '\n'
             )
             try:
                 text2 = _call_gemini_text(system, user2, model=model)
+                if text2 and text2.strip() and text2.strip() not in text:
+                    text = (text.rstrip() + '\n\n' + text2.strip()).strip()
             except Exception:
-                break
-            if not text2 or not text2.strip():
-                break
-            t2 = text2.strip()
-            if t2 in text:
-                break
-            text = (text.rstrip() + "\n\n" + t2).strip()
-
+                pass
         result = {"text": text, "model": model, "style": payload.style}
 
         if payload.debug:
@@ -1963,3 +1561,984 @@ def ai_interpret(
         return ApiOut(ok=True, result=result, warnings=warnings)
     except Exception as e:
         return ApiOut(ok=False, result={"error": str(e)}, warnings=[])
+
+
+
+
+# ---------------------------
+# Compatibility endpoints: SARIMA / SARIMAX wrappers
+# These keep your HTML stable even if it calls explicit SARIMA/SARIMAX routes.
+# ---------------------------
+
+@router.post("/tsa/J_sarima_forecast", response_model=ApiOut)
+def tsa_j_sarima_forecast(payload: ForecastIn):
+    # Force seasonal = True; otherwise use the same logic as ARIMA endpoint.
+    try:
+        p2 = payload.model_copy(deep=True)  # pydantic v2
+    except Exception:
+        p2 = payload  # fallback
+    try:
+        setattr(p2, "seasonal", True)
+    except Exception:
+        pass
+    return tsa_j_arima_forecast(p2)
+
+
+class SARIMAXIn(BaseModel):
+    series: SeriesIn
+    horizon: int = 30
+    # If provided, use these; otherwise auto-fit like Auto-ARIMA
+    order: Optional[Tuple[int, int, int]] = None
+    seasonal_order: Optional[Tuple[int, int, int, int]] = None
+    seasonal_period: Optional[int] = None
+    auto: bool = True
+    # Optional exogenous regressors:
+    # - exog: length n (aligned with series)
+    # - exog_future: length horizon (future values)
+    exog: Optional[List[float]] = None
+    exog_future: Optional[List[float]] = None
+
+
+@router.post("/tsa/J_sarimax_forecast", response_model=ApiOut)
+def tsa_j_sarimax_forecast(payload: SARIMAXIn):
+    """
+    SARIMAX forecast (supports optional exogenous regressor arrays).
+    If no exog is supplied, behaves like SARIMA.
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    h = int(max(1, payload.horizon))
+
+    sp = payload.seasonal_period
+    if sp is None:
+        sp = _seasonal_period_from_inputs(freq, None)
+    sp = int(sp or 0)
+
+    exog = None
+    exog_future = None
+    if payload.exog is not None:
+        try:
+            exog = np.asarray(payload.exog, dtype="float64")
+            if exog.shape[0] != len(y2):
+                warnings.append("exog length does not match series length; ignoring exog.")
+                exog = None
+        except Exception:
+            exog = None
+    if payload.exog_future is not None:
+        try:
+            exog_future = np.asarray(payload.exog_future, dtype="float64")
+            if exog_future.shape[0] != h:
+                warnings.append("exog_future length does not match horizon; ignoring exog_future.")
+                exog_future = None
+        except Exception:
+            exog_future = None
+
+    # Choose orders
+    order = payload.order
+    sorder = payload.seasonal_order
+    if payload.auto or (order is None):
+        o, so, w = _fit_arima_grid(
+            y2,
+            seasonal_period=sp,
+            seasonal=(sp >= 2),
+            max_p=3, max_d=1, max_q=3,
+            max_P=1, max_D=1, max_Q=1
+        )
+        warnings += w
+        order = tuple(map(int, o))
+        sorder = tuple(map(int, so))
+    else:
+        order = tuple(map(int, order))
+        sorder = tuple(map(int, sorder or (0, 0, 0, 0)))
+
+    # Normalize seasonal if not meaningful
+    if not sorder or int(sorder[3]) < 2:
+        sorder = (0, 0, 0, 0)
+
+    try:
+        d = int(order[1])
+        D = int(sorder[1]) if sorder else 0
+        simple_diff = (d > 0) or (D > 0)
+
+        model = SARIMAX(
+            y2,
+            exog=exog,
+            order=order,
+            seasonal_order=sorder,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            simple_differencing=simple_diff,
+            low_memory=True,
+        )
+        res = model.fit(disp=False, maxiter=80)
+        fc = res.get_forecast(steps=h, exog=exog_future)
+        mean = fc.predicted_mean
+        ci = fc.conf_int(alpha=0.05)
+        x_fc = _forecast_index(y2, h)
+
+        return ApiOut(
+            ok=True,
+            result={
+                "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
+                "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
+                "used_exog": bool(exog is not None and exog_future is not None),
+                "aic": safe_float(res.aic),
+                "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+                "conf_int_95": {"lower": _as_float_list(ci.iloc[:, 0].values), "upper": _as_float_list(ci.iloc[:, 1].values)},
+            },
+            warnings=warnings,
+        )
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"SARIMAX failed: {str(e)}"}, warnings=warnings)
+
+# ============================
+# Extra TSA methods (MSTL, changepoints, fingerprint, auto models, conformal, and optional deep models)
+# These are added in a way that does NOT break existing endpoints.
+# Some "deep" methods require optional dependencies; if missing, the endpoint returns HTTP 501 with install guidance.
+# ============================
+
+class MSTLIn(BaseModel):
+    series: SeriesIn
+    periods: Optional[List[int]] = None
+    robust: bool = True
+
+
+def _default_mstl_periods(freq: Optional[str]) -> List[int]:
+    """Pick a practical set of seasonal periods from inferred pandas freq string."""
+    f = (freq or "").upper()
+    # common pandas freq strings: 'D', 'H', 'M', 'MS', 'W', 'Q', 'A', 'AS', 'B', etc.
+    if f.startswith("H"):
+        return [24, 24 * 7]          # daily + weekly
+    if f.startswith("D") or f.startswith("B"):
+        return [7, 365]              # weekly + yearly
+    if f.startswith("W"):
+        return [52]                  # yearly (weekly data)
+    if f.startswith("M"):
+        return [12]                  # yearly (monthly data)
+    if f.startswith("Q"):
+        return [4]                   # yearly (quarterly data)
+    if f.startswith("A") or f.startswith("Y"):
+        return []                    # annual data: no meaningful seasonality
+    # fallback: try the default period from your helper, and also a weekly component
+    try:
+        sp = int(default_seasonal_period(freq))
+        return [sp] if sp >= 2 else []
+    except Exception:
+        return []
+
+
+@router.post("/tsa/O_mstl_decompose", response_model=ApiOut)
+def tsa_o_mstl_decompose(payload: MSTLIn):
+    """
+    MSTL decomposition: trend + multiple seasonalities + residual.
+    Returns each seasonal component separately plus the combined seasonal.
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+
+    if len(y2) < 10:
+        return ApiOut(ok=False, result={"error": "Not enough data for MSTL (need ~10+ points)."}, warnings=warnings)
+
+    periods = payload.periods or _default_mstl_periods(freq)
+    periods = [int(p) for p in periods if p and int(p) >= 2]
+    # MSTL needs at least one period
+    if not periods:
+        return ApiOut(ok=False, result={"error": "No valid seasonal periods for MSTL. Provide 'periods' (e.g., [7,365] or [12])."}, warnings=warnings)
+
+    # Guard periods relative to series length
+    max_allowed = max(2, len(y2) // 2)
+    periods2 = []
+    for p in periods:
+        if p > max_allowed:
+            warnings.append(f"MSTL: period {p} too large for series length; adjusted to {max_allowed}.")
+            p = max_allowed
+        if p >= 2:
+            periods2.append(int(p))
+    periods = sorted(list(dict.fromkeys(periods2)))
+    if not periods:
+        return ApiOut(ok=False, result={"error": "After adjustment, no valid MSTL periods remained."}, warnings=warnings)
+
+    try:
+        from statsmodels.tsa.seasonal import MSTL  # type: ignore
+    except Exception:
+        return ApiOut(ok=False, result={"error": "MSTL not available in your statsmodels version. Upgrade statsmodels (>=0.14)."}, warnings=warnings)
+
+    try:
+        stl_kwargs = {"robust": bool(payload.robust)}
+        mstl = MSTL(y2, periods=periods, stl_kwargs=stl_kwargs).fit()
+        trend = mstl.trend.reindex(y.index)
+        resid = mstl.resid.reindex(y.index)
+
+        # seasonal can be DataFrame (one column per period) or Series depending on version
+        seasonals: Dict[str, Any] = {}
+        combined = None
+
+        seas = getattr(mstl, "seasonal", None)
+        if seas is None:
+            seas = getattr(mstl, "seasonal_", None)
+
+        if seas is not None:
+            if hasattr(seas, "columns"):
+                for col in list(seas.columns):
+                    s = seas[col].reindex(y.index)
+                    seasonals[str(col)] = to_jsonable_series(s)
+                try:
+                    combined = seas.sum(axis=1).reindex(y.index)
+                except Exception:
+                    combined = None
+            else:
+                combined = seas.reindex(y.index)
+
+        result = {
+            "periods_used": periods,
+            "freq_inferred": freq,
+            "series": to_jsonable_series(y),
+            "trend": to_jsonable_series(trend),
+            "resid": to_jsonable_series(resid),
+            "seasonal_components": seasonals,
+        }
+        if combined is not None:
+            result["seasonal"] = to_jsonable_series(combined)
+
+        return ApiOut(ok=True, result=result, warnings=warnings)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"MSTL failed: {str(e)}"}, warnings=warnings)
+
+
+class ChangepointIn(BaseModel):
+    series: SeriesIn
+    n_bkps: Optional[int] = Field(default=5, description="Target number of change points (approx).")
+    penalty: Optional[float] = Field(default=None, description="Penalty for PELT (if using ruptures).")
+    min_size: Optional[int] = Field(default=5, description="Minimum segment length.")
+    model: Optional[str] = Field(default="l2", description="ruptures cost model, e.g., 'l2'.")
+
+
+def _simple_changepoints_fallback(yv: np.ndarray, k: int, min_gap: int) -> List[int]:
+    """Dependency-free fallback: detect large changes in rolling mean."""
+    n = int(len(yv))
+    if n < 2 * max(3, min_gap):
+        return []
+    w = max(3, min_gap)
+    s = pd.Series(yv).rolling(w, center=True, min_periods=w).mean().values
+    d = np.abs(np.diff(s))
+    # pick top-k peaks separated by min_gap
+    idx = np.argsort(-np.nan_to_num(d, nan=-np.inf))
+    chosen: List[int] = []
+    for i in idx:
+        cp = int(i + 1)  # diff index -> split index
+        if cp < w or cp > (n - w):
+            continue
+        if all(abs(cp - c) >= min_gap for c in chosen):
+            chosen.append(cp)
+        if len(chosen) >= k:
+            break
+    return sorted(chosen)
+
+
+@router.post("/tsa/P_changepoints", response_model=ApiOut)
+def tsa_p_changepoints(payload: ChangepointIn):
+    """
+    Changepoint detection.
+    Uses 'ruptures' if installed; otherwise uses a lightweight fallback.
+    """
+    y, warnings, _freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    if len(y2) < 20:
+        warnings.append("Short series; changepoint results may be unstable.")
+
+    yv = y2.values.astype("float64")
+    n = int(len(yv))
+    k = int(max(0, min(int(payload.n_bkps or 0), max(0, n // 5))))
+    min_size = int(max(2, int(payload.min_size or 5)))
+
+    bkps: List[int] = []
+    method_used = "fallback"
+
+    # Try ruptures (recommended)
+    try:
+        import ruptures as rpt  # type: ignore
+        method_used = "ruptures"
+        sig = yv.reshape(-1, 1)
+        if k <= 0:
+            # PELT with penalty
+            pen = payload.penalty
+            if pen is None:
+                # heuristic penalty
+                pen = float(np.log(max(n, 2)) * (np.nanvar(yv) + 1e-9))
+            algo = rpt.Pelt(model=str(payload.model or "l2"), min_size=min_size).fit(sig)
+            bkps = [int(b) for b in algo.predict(pen=float(pen)) if int(b) < n]
+        else:
+            algo = rpt.Binseg(model=str(payload.model or "l2"), min_size=min_size).fit(sig)
+            bkps = [int(b) for b in algo.predict(n_bkps=int(k)) if int(b) < n]
+    except Exception:
+        # fallback
+        if k <= 0:
+            k = 5
+        bkps = _simple_changepoints_fallback(yv, k=k, min_gap=min_size)
+
+    # Convert to dates
+    cps = []
+    for b in bkps:
+        if b <= 0 or b >= n:
+            continue
+        idx = y2.index[b - 1]  # end of segment
+        cps.append({
+            "index": int(b),
+            "x": idx.isoformat() if isinstance(y2.index, pd.DatetimeIndex) else safe_float(b),
+            "y": safe_float(y2.iloc[b - 1]),
+        })
+
+    return ApiOut(
+        ok=True,
+        result={
+            "method": method_used,
+            "n": int(n),
+            "change_points": cps,
+        },
+        warnings=warnings,
+    )
+
+
+class FingerprintIn(BaseModel):
+    series: SeriesIn
+    period: Optional[int] = None
+
+
+@router.post("/tsa/Q_fingerprint", response_model=ApiOut)
+def tsa_q_fingerprint(payload: FingerprintIn):
+    """
+    Compact "series fingerprint" for quick diagnostics and for AI context.
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    n = int(len(y2))
+    if n == 0:
+        return ApiOut(ok=False, result={"error": "All values are missing."}, warnings=warnings)
+
+    period = payload.period
+    if period is None:
+        try:
+            period = int(default_seasonal_period(freq))
+        except Exception:
+            period = None
+
+    # Basic stats
+    vals = y2.values.astype("float64")
+    mu = float(np.nanmean(vals))
+    sd = float(np.nanstd(vals, ddof=1)) if n > 1 else float("nan")
+    vmin = float(np.nanmin(vals))
+    vmax = float(np.nanmax(vals))
+
+    # Trend slope (simple linear fit vs. time index)
+    slope = None
+    try:
+        t = np.arange(n, dtype="float64")
+        A = np.vstack([t, np.ones_like(t)]).T
+        m, c = np.linalg.lstsq(A, vals, rcond=None)[0]
+        slope = float(m)
+    except Exception:
+        slope = None
+
+    # Autocorr at a few lags
+    def _ac(lag: int) -> Optional[float]:
+        try:
+            if lag <= 0 or lag >= n:
+                return None
+            a = np.corrcoef(vals[:-lag], vals[lag:])[0, 1]
+            return safe_float(a)
+        except Exception:
+            return None
+
+    ac1 = _ac(1)
+    ac7 = _ac(7) if n > 8 else None
+    ac_sp = _ac(int(period)) if (period and isinstance(period, int) and period > 1 and n > period + 2) else None
+
+    # Outlier ratio (IQR)
+    outlier_ratio = None
+    try:
+        q1, q3 = np.nanpercentile(vals, [25, 75])
+        iqr = q3 - q1
+        if np.isfinite(iqr) and iqr > 0:
+            lo = q1 - 1.5 * iqr
+            hi = q3 + 1.5 * iqr
+            outlier_ratio = float(np.mean((vals < lo) | (vals > hi)))
+    except Exception:
+        outlier_ratio = None
+
+    # Stationarity (ADF p-value) - quick, may fail on tiny series
+    adf_p = None
+    try:
+        if n >= 12:
+            adf = adfuller(vals, autolag="AIC")
+            adf_p = float(adf[1])
+    except Exception:
+        adf_p = None
+
+    # Seasonality & trend strength via STL (optional, fast)
+    trend_strength = None
+    seasonal_strength = None
+    if period and isinstance(period, int) and period >= 2 and n >= 2 * period:
+        try:
+            stl = STL(y2, period=int(period), robust=True).fit()
+            resid = stl.resid.values
+            tr = stl.trend.values
+            seas = stl.seasonal.values
+
+            var_r = np.nanvar(resid, ddof=1)
+            var_tr = np.nanvar(tr + resid, ddof=1)
+            var_sr = np.nanvar(seas + resid, ddof=1)
+
+            if np.isfinite(var_r) and np.isfinite(var_tr) and var_tr > 0:
+                trend_strength = float(1.0 - (var_r / var_tr))
+            if np.isfinite(var_r) and np.isfinite(var_sr) and var_sr > 0:
+                seasonal_strength = float(1.0 - (var_r / var_sr))
+        except Exception:
+            pass
+
+    # Entropy-ish measure (binned)
+    entropy = None
+    try:
+        bins = max(8, int(np.sqrt(n)))
+        hist, _ = np.histogram(vals[np.isfinite(vals)], bins=bins)
+        p = hist.astype("float64")
+        p = p / (p.sum() + 1e-12)
+        p = p[p > 0]
+        entropy = float(-(p * np.log(p)).sum())
+    except Exception:
+        entropy = None
+
+    result = {
+        "n": int(n),
+        "freq_inferred": freq,
+        "min": safe_float(vmin),
+        "max": safe_float(vmax),
+        "mean": safe_float(mu),
+        "std": safe_float(sd),
+        "trend_slope": safe_float(slope),
+        "autocorr_lag1": ac1,
+        "autocorr_lag7": ac7,
+        "autocorr_lag_seasonal": ac_sp,
+        "adf_pvalue": safe_float(adf_p),
+        "trend_strength": safe_float(trend_strength),
+        "seasonal_strength": safe_float(seasonal_strength),
+        "outlier_ratio": safe_float(outlier_ratio),
+        "entropy": safe_float(entropy),
+    }
+    return ApiOut(ok=True, result=result, warnings=warnings)
+
+
+class AutoETSIn(BaseModel):
+    series: SeriesIn
+    horizon: int = 30
+    seasonal_period: Optional[int] = None
+
+
+@router.post("/tsa/R_auto_ets_forecast", response_model=ApiOut)
+def tsa_r_auto_ets_forecast(payload: AutoETSIn):
+    """
+    Auto-ETS: tries a small set of ETS configurations and picks the best (AIC / SSE).
+    Uses statsmodels ExponentialSmoothing.
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    n = int(len(y2))
+    h = int(max(1, payload.horizon))
+
+    sp = payload.seasonal_period
+    if sp is None:
+        sp = _seasonal_period_from_inputs(freq, None)
+    sp = int(sp or 0)
+
+    if n < 8:
+        return ApiOut(ok=False, result={"error": "Series too short for Auto-ETS."}, warnings=warnings)
+
+    # Candidate config list (kept small for web performance)
+    candidates = []
+    candidates.append((None, None, False))
+    candidates.append(("add", None, False))
+    candidates.append(("add", None, True))
+    # seasonal only when enough data
+    if sp >= 2 and n >= 2 * sp:
+        candidates.append((None, "add", False))
+        candidates.append(("add", "add", False))
+        candidates.append(("add", "add", True))
+
+    # Allow multiplicative only if strictly positive
+    if y2.min() > 0 and sp >= 2 and n >= 2 * sp:
+        candidates.append((None, "mul", False))
+        candidates.append(("add", "mul", False))
+        candidates.append(("add", "mul", True))
+
+    best = None
+    best_score = np.inf
+    best_res = None
+
+    for trend, seas, damped in candidates:
+        try:
+            model = ExponentialSmoothing(
+                y2,
+                trend=trend,
+                damped_trend=(bool(damped) if trend else False),
+                seasonal=seas,
+                seasonal_periods=(sp if seas else None),
+                initialization_method="estimated",
+            )
+            res = model.fit(optimized=True)
+            # Prefer AIC if available, else SSE
+            score = getattr(res, "aic", None)
+            if score is None or not np.isfinite(score):
+                fitted = getattr(res, "fittedvalues", None)
+                if fitted is None:
+                    continue
+                resid = (y2 - fitted).dropna()
+                score = float(np.sum(np.square(resid.values))) if len(resid) else np.inf
+            score = float(score)
+            if np.isfinite(score) and score < best_score:
+                best_score = score
+                best = (trend, seas, damped)
+                best_res = res
+        except Exception:
+            continue
+
+    if best_res is None or best is None:
+        return ApiOut(ok=False, result={"error": "Auto-ETS could not fit any candidate."}, warnings=warnings)
+
+    mean = best_res.forecast(h)
+    x_fc = _forecast_index(y2, h)
+
+    # Simple residual-based interval
+    lower = upper = None
+    try:
+        fitted = getattr(best_res, "fittedvalues", None)
+        if fitted is not None:
+            resid = (y2 - fitted).dropna()
+            if len(resid) >= 8:
+                q = float(np.nanquantile(np.abs(resid.values), 0.95))
+                lower = mean - q
+                upper = mean + q
+    except Exception:
+        pass
+
+    trend, seas, damped = best
+    result = {
+        "best_model": {
+            "type": "AutoETS",
+            "trend": trend,
+            "seasonal": seas,
+            "damped_trend": bool(damped if trend else False),
+            "seasonal_period_used": int(sp) if seas else None,
+            "score": safe_float(best_score),
+            "score_type": "aic_or_sse",
+        },
+        "horizon": int(h),
+        "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+    }
+    if lower is not None and upper is not None:
+        result["conf_int_approx"] = {
+            "lower": _as_float_list(lower.values),
+            "upper": _as_float_list(upper.values),
+            "note": "Approx interval from residual absolute-quantile (quick, not exact).",
+        }
+
+    return ApiOut(ok=True, result=result, warnings=warnings)
+
+
+class AutoARIMAIn(BaseModel):
+    series: SeriesIn
+    horizon: int = 30
+    seasonal: bool = False
+    seasonal_period: Optional[int] = None
+
+
+@router.post("/tsa/S_auto_arima_forecast", response_model=ApiOut)
+def tsa_s_auto_arima_forecast(payload: AutoARIMAIn):
+    """
+    Auto-ARIMA/SARIMA forecast. Thin wrapper around the same grid logic used in J_arima_forecast.
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    if len(y2) < 12:
+        warnings.append("Short series; Auto-ARIMA may be unstable.")
+
+    h = int(max(1, payload.horizon))
+    sp = payload.seasonal_period
+    if sp is None:
+        sp = _seasonal_period_from_inputs(freq, None)
+
+    order, sorder, w = _fit_arima_grid(
+        y2,
+        seasonal_period=int(sp or 0),
+        seasonal=bool(payload.seasonal),
+        max_p=3, max_d=1, max_q=3,
+        max_P=1, max_D=1, max_Q=1
+    )
+    warnings += w
+
+    # Normalize seasonal order
+    P, D, Q, s = sorder
+    if (not payload.seasonal) or (s is None) or (int(s) < 2) or (P == 0 and D == 0 and Q == 0):
+        sorder = (0, 0, 0, 0)
+
+    try:
+        d = int(order[1])
+        D = int(sorder[1]) if sorder else 0
+        simple_diff = (d > 0) or (D > 0)
+
+        model = SARIMAX(
+            y2,
+            order=tuple(map(int, order)),
+            seasonal_order=tuple(map(int, sorder)),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            simple_differencing=simple_diff,
+            low_memory=True,
+        )
+        res = model.fit(disp=False, maxiter=60)
+        fc = res.get_forecast(steps=h)
+        mean = fc.predicted_mean
+        ci = fc.conf_int(alpha=0.05)
+        x_fc = _forecast_index(y2, h)
+
+        return ApiOut(
+            ok=True,
+            result={
+                "order": {"p": int(order[0]), "d": int(order[1]), "q": int(order[2])},
+                "seasonal_order": {"P": int(sorder[0]), "D": int(sorder[1]), "Q": int(sorder[2]), "s": int(sorder[3])},
+                "aic": safe_float(res.aic),
+                "forecast": {"x": x_fc, "y": _as_float_list(mean.values)},
+                "conf_int_95": {"lower": _as_float_list(ci.iloc[:, 0].values), "upper": _as_float_list(ci.iloc[:, 1].values)},
+            },
+            warnings=warnings,
+        )
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"Auto-ARIMA failed: {str(e)}"}, warnings=warnings)
+
+
+class STLForecastIn(BaseModel):
+    series: SeriesIn
+    horizon: int = 30
+    period: Optional[int] = None
+    robust: bool = True
+    remainder_model: str = "theta"  # 'theta' or 'arima010'
+
+
+@router.post("/tsa/T_stl_forecast", response_model=ApiOut)
+def tsa_t_stl_forecast(payload: STLForecastIn):
+    """
+    STL + forecast:
+      - Decompose with STL
+      - Seasonal forecast by repeating last season
+      - Remainder/trend forecast with a lightweight model
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    n = int(len(y2))
+    if n < 12:
+        return ApiOut(ok=False, result={"error": "Not enough data for STL forecast (need ~12+ points)."}, warnings=warnings)
+
+    h = int(max(1, payload.horizon))
+    period = payload.period
+    if period is None:
+        period = int(default_seasonal_period(freq))
+    period = int(max(2, min(int(period), max(2, n // 2))))
+
+    try:
+        stl = STL(y2, period=period, robust=bool(payload.robust)).fit()
+        trend = stl.trend
+        seas = stl.seasonal
+        resid = stl.resid
+
+        # Seasonal forecast: repeat last period of seasonal component
+        last_seas = seas.iloc[-period:].values
+        reps = int(np.ceil(h / period))
+        seas_fc = np.tile(last_seas, reps)[:h].astype("float64")
+
+        # Remainder series to forecast (trend + resid)
+        rem = (trend + resid).astype("float64")
+
+        base = payload.remainder_model.lower().strip()
+        if base == "arima010":
+            # very fast baseline (random-walk)
+            model = SARIMAX(rem, order=(0, 1, 0), seasonal_order=(0, 0, 0, 0), enforce_stationarity=False, enforce_invertibility=False)
+            res = model.fit(disp=False, maxiter=40)
+            mean_rem = res.get_forecast(steps=h).predicted_mean.values.astype("float64")
+        else:
+            # theta is usually stable
+            sp = max(1, period)
+            res = ThetaModel(rem, period=sp).fit()
+            mean_rem = res.forecast(h).values.astype("float64")
+
+        mean = mean_rem + seas_fc
+        x_fc = _forecast_index(y2, h)
+
+        result = {
+            "period_used": int(period),
+            "remainder_model": base,
+            "components": {
+                "trend": to_jsonable_series(trend.reindex(y.index)),
+                "seasonal": to_jsonable_series(seas.reindex(y.index)),
+                "resid": to_jsonable_series(resid.reindex(y.index)),
+            },
+            "forecast": {"x": x_fc, "y": _as_float_list(mean)},
+        }
+        return ApiOut(ok=True, result=result, warnings=warnings)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"STL forecast failed: {str(e)}"}, warnings=warnings)
+
+
+class ConformalIn(BaseModel):
+    series: SeriesIn
+    horizon: int = 30
+    base_model: str = "arima"   # arima|ets|theta|naive|seasonal_naive
+    alpha: float = 0.1          # 0.1 => 90% interval (approx)
+    seasonal_period: Optional[int] = None
+
+
+@router.post("/tsa/U_conformal_forecast", response_model=ApiOut)
+def tsa_u_conformal_forecast(payload: ConformalIn):
+    """
+    Conformal-style intervals (fast approximation):
+      - Fit a base model
+      - Forecast mean
+      - Interval width from residual absolute quantile (1-alpha) on fitted residuals
+    This is *approximate* but very practical for web dashboards.
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    n = int(len(y2))
+    if n < 12:
+        warnings.append("Short series; conformal intervals may be noisy.")
+
+    h = int(max(1, payload.horizon))
+    alpha = float(payload.alpha)
+    alpha = min(max(alpha, 0.01), 0.5)
+
+    sp = payload.seasonal_period
+    if sp is None:
+        sp = _seasonal_period_from_inputs(freq, None)
+    sp = int(sp or 1)
+
+    base = payload.base_model.lower().strip()
+    mean = None
+    resid_abs = None
+
+    try:
+        if base in ("naive", "seasonal_naive", "theta", "ets"):
+            # use existing helper for mean forecast
+            mean = _fit_and_forecast(base, y2, h, sp)
+            # residuals: one-step fitted values (rough)
+            if base == "naive":
+                fitted = y2.shift(1)
+                resid_abs = np.abs((y2 - fitted).dropna().values)
+            elif base == "seasonal_naive":
+                fitted = y2.shift(sp)
+                resid_abs = np.abs((y2 - fitted).dropna().values)
+            elif base == "theta":
+                res = ThetaModel(y2, period=max(1, sp)).fit()
+                fitted = getattr(res, "fittedvalues", None)
+                if fitted is not None:
+                    resid_abs = np.abs((y2 - fitted).dropna().values)
+            elif base == "ets":
+                seasonal = "add" if (sp >= 2 and len(y2) >= 2 * sp) else None
+                model = ExponentialSmoothing(y2, trend="add", seasonal=seasonal, seasonal_periods=(sp if seasonal else None))
+                res = model.fit(optimized=True)
+                fitted = getattr(res, "fittedvalues", None)
+                if fitted is not None:
+                    resid_abs = np.abs((y2 - fitted).dropna().values)
+        else:
+            # arima (auto, small grid)
+            order, sorder, w = _fit_arima_grid(
+                y2,
+                seasonal_period=sp,
+                seasonal=(sp >= 2),
+                max_p=3, max_d=1, max_q=3,
+                max_P=1, max_D=1, max_Q=1
+            )
+            warnings += w
+            d = int(order[1])
+            D = int(sorder[1]) if sorder else 0
+            simple_diff = (d > 0) or (D > 0)
+            model = SARIMAX(
+                y2,
+                order=tuple(map(int, order)),
+                seasonal_order=tuple(map(int, sorder)),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                simple_differencing=simple_diff,
+                low_memory=True,
+            )
+            res = model.fit(disp=False, maxiter=60)
+            fc = res.get_forecast(steps=h)
+            mean = fc.predicted_mean.values.astype("float64")
+            fitted = getattr(res, "fittedvalues", None)
+            if fitted is not None:
+                resid_abs = np.abs((y2 - fitted).dropna().values)
+
+        if mean is None:
+            raise RuntimeError("Base model did not return a forecast.")
+
+        # interval half-width
+        q = None
+        if resid_abs is not None and len(resid_abs) >= 8:
+            q = float(np.nanquantile(resid_abs, 1.0 - alpha))
+        else:
+            # fallback using sd
+            q = float(np.nanstd(y2.values, ddof=1) if n > 1 else 0.0)
+
+        lower = mean - q
+        upper = mean + q
+        x_fc = _forecast_index(y2, h)
+
+        result = {
+            "base_model": base,
+            "alpha": alpha,
+            "interval_note": "Approx residual-quantile interval (practical conformal-style).",
+            "forecast": {"x": x_fc, "y": _as_float_list(mean)},
+            "conf_int": {"lower": _as_float_list(lower), "upper": _as_float_list(upper)},
+        }
+        return ApiOut(ok=True, result=result, warnings=warnings)
+
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"Conformal forecast failed: {str(e)}"}, warnings=warnings)
+
+
+# ---------------------------
+# Optional "Deep/Modern" forecasting methods (placeholders unless dependencies are installed)
+# ---------------------------
+
+class DeepForecastIn(BaseModel):
+    series: SeriesIn
+    horizon: int = 30
+    seasonal_period: Optional[int] = None
+    max_train_points: int = 2000
+    epochs: int = 30
+    model_name: Optional[str] = None  # used for transformer-family chooser
+
+
+def _require_optional(dep_name: str, hint: str) -> None:
+    raise HTTPException(status_code=501, detail=f"Optional dependency missing for {dep_name}. {hint}")
+
+
+@router.post("/tsa/V_neuralprophet_forecast", response_model=ApiOut)
+def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
+    """
+    NeuralProphet forecast (optional).
+    Requires: neuralprophet (+ torch)
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    if len(y2) > int(payload.max_train_points):
+        warnings.append(f"NeuralProphet: using last {int(payload.max_train_points)} points for speed.")
+        y2 = y2.iloc[-int(payload.max_train_points):]
+    h = int(max(1, payload.horizon))
+
+    try:
+        from neuralprophet import NeuralProphet  # type: ignore
+    except Exception:
+        _require_optional("NeuralProphet", "Add `neuralprophet` to requirements.txt (includes torch).")
+
+    # Build df with ds/y
+    try:
+        df = pd.DataFrame({"ds": pd.to_datetime(y2.index), "y": y2.values})
+        m = NeuralProphet(epochs=int(max(5, payload.epochs)))
+        m.fit(df, freq=(infer_freq_safe(y2.index) or "D"), progress="off")
+        future = m.make_future_dataframe(df, periods=h, n_historic_predictions=False)
+        fcst = m.predict(future)
+        # NeuralProphet returns yhat1 column
+        yhat = fcst["yhat1"].values.astype("float64")
+        x_fc = _forecast_index(y2, h)
+        return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "NeuralProphet"}, warnings=warnings)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"NeuralProphet failed: {str(e)}"}, warnings=warnings)
+
+
+@router.post("/tsa/W_nhits_forecast", response_model=ApiOut)
+def tsa_w_nhits_forecast(payload: DeepForecastIn):
+    """
+    N-HiTS forecast (optional).
+    Recommended lightweight path: StatsForecast (if installed).
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    if len(y2) > int(payload.max_train_points):
+        warnings.append(f"NHiTS: using last {int(payload.max_train_points)} points for speed.")
+        y2 = y2.iloc[-int(payload.max_train_points):]
+    h = int(max(1, payload.horizon))
+
+    try:
+        # StatsForecast provides NHiTS with good performance
+        from statsforecast import StatsForecast  # type: ignore
+        from statsforecast.models import NHiTS  # type: ignore
+    except Exception:
+        _require_optional("StatsForecast NHiTS", "Add `statsforecast` to requirements.txt.")
+
+    try:
+        # Build dataframe expected by StatsForecast
+        ds = pd.to_datetime(y2.index)
+        df = pd.DataFrame({"unique_id": "s", "ds": ds, "y": y2.values.astype("float64")})
+        sf = StatsForecast(models=[NHiTS()], freq=(infer_freq_safe(ds) or "D"), n_jobs=1)
+        fcst = sf.forecast(df=df, h=h)
+        col = [c for c in fcst.columns if c not in ("unique_id", "ds")][0]
+        yhat = fcst[col].values.astype("float64")
+        x_fc = [d.isoformat() for d in fcst["ds"].tolist()]
+        return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "NHiTS"}, warnings=warnings)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"NHiTS failed: {str(e)}"}, warnings=warnings)
+
+
+@router.post("/tsa/X_patchtst_or_tide_forecast", response_model=ApiOut)
+def tsa_x_patchtst_or_tide_forecast(payload: DeepForecastIn):
+    """
+    PatchTST / TiDE (optional).
+    Practical implementation path: `darts` library (if installed).
+    """
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    if len(y2) > int(payload.max_train_points):
+        warnings.append(f"PatchTST/TiDE: using last {int(payload.max_train_points)} points for speed.")
+        y2 = y2.iloc[-int(payload.max_train_points):]
+    h = int(max(1, payload.horizon))
+
+    model_name = (payload.model_name or "tide").lower().strip()
+    if model_name not in ("patchtst", "tide"):
+        model_name = "tide"
+
+    try:
+        from darts import TimeSeries  # type: ignore
+        from darts.models import PatchTSTModel, TiDEModel  # type: ignore
+    except Exception:
+        _require_optional("darts (PatchTST/TiDE)", "Add `u8darts[torch]` to requirements.txt (includes torch).")
+
+    try:
+        ts = TimeSeries.from_times_and_values(pd.to_datetime(y2.index), y2.values.astype("float64"))
+        if model_name == "patchtst":
+            model = PatchTSTModel(input_chunk_length=min(96, max(12, len(y2)//4)), output_chunk_length=h, n_epochs=int(max(5, payload.epochs)))
+        else:
+            model = TiDEModel(input_chunk_length=min(96, max(12, len(y2)//4)), output_chunk_length=h, n_epochs=int(max(5, payload.epochs)))
+        model.fit(ts, verbose=False)
+        pred = model.predict(h)
+        yhat = pred.values().squeeze().astype("float64")
+        x_fc = _forecast_index(y2, h)
+        return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": model_name}, warnings=warnings)
+    except Exception as e:
+        return ApiOut(ok=False, result={"error": f"{model_name} failed: {str(e)}"}, warnings=warnings)
+
+
+@router.post("/tsa/Y_transformer_family_forecast", response_model=ApiOut)
+def tsa_y_transformer_family_forecast(payload: DeepForecastIn):
+    """
+    Transformer-family placeholders: TimesNet / iTransformer / SOFTS.
+    Implementation depends on which library you choose (many are research code).
+    This endpoint is here so your frontend can already "see" the method, and you can wire it later.
+
+    Recommended practical path (production): use `darts` TransformerModel or `gluonts`/`pytorch-forecasting`.
+    """
+    name = (payload.model_name or "itransformer").lower().strip()
+    if name not in ("timesnet", "itransformer", "softs"):
+        name = "itransformer"
+
+    _require_optional(
+        f"{name}",
+        "This model family is not bundled by default. Choose a library (e.g., u8darts[torch] TransformerModel, or your preferred implementation), "
+        "add it to requirements.txt, then implement training/inference here."
+    )

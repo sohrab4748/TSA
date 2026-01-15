@@ -2416,129 +2416,173 @@ class DeepForecastIn(BaseModel):
 
 
 def _require_optional(dep_name: str, hint: str) -> None:
+    """Raise a consistent 501 when an optional dependency isn't installed."""
     raise HTTPException(status_code=501, detail=f"Optional dependency missing for {dep_name}. {hint}")
+
+
+def _infer_nf_freq(dt_index: pd.DatetimeIndex) -> str:
+    """Infer a NeuralForecast frequency string."""
+    try:
+        f = pd.infer_freq(dt_index)
+    except Exception:
+        f = None
+    if not f:
+        return "D"
+    # Use the base alias (e.g., 'D', 'H', 'M', 'MS', 'W-SUN', 'QS-DEC'...)
+    # NeuralForecast uses pandas offsets; we'll pass the inferred alias directly when possible.
+    return f
+
+
+def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor):
+    """Run a NeuralForecast model on a single time series."""
+    y, warnings, freq = _prep_series(payload.series)
+    y2 = y.dropna()
+    if len(y2) < 20:
+        raise HTTPException(status_code=400, detail="Need at least 20 non-missing points for deep forecasting models.")
+    # limit training length
+    if len(y2) > int(payload.max_train_points):
+        y2 = y2.iloc[-int(payload.max_train_points):]
+        warnings.append(f"Trimmed series to last {payload.max_train_points} points for deep model training.")
+    h = int(payload.horizon)
+    if h < 1:
+        raise HTTPException(status_code=422, detail="horizon must be >= 1")
+
+    # input window (lags)
+    # A simple robust choice: at least 24, or 2*h, but not more than ~half the data.
+    input_size = max(24, 2 * h)
+    input_size = min(input_size, max(8, len(y2) // 2))
+    # training steps (keep it small for API usage)
+    max_steps = int(os.getenv("DEEP_MAX_STEPS", str(max(100, min(1000, payload.epochs * 50)))))
+    # build df in NeuralForecast format
+    df = pd.DataFrame({"unique_id": "ts", "ds": y2.index.to_pydatetime(), "y": y2.values.astype("float64")})
+    nf_freq = _infer_nf_freq(pd.DatetimeIndex(df["ds"]))
+
+    try:
+        from neuralforecast import NeuralForecast
+    except Exception:
+        _require_optional("neuralforecast", "Install neuralforecast in requirements.txt and redeploy.")
+
+    # create model instance
+    try:
+        model = model_ctor(h=h, input_size=input_size, max_steps=max_steps)
+    except TypeError:
+        # some models use different signature; try without max_steps
+        model = model_ctor(h=h, input_size=input_size)
+
+    nf = NeuralForecast(models=[model], freq=nf_freq)
+    nf.fit(df=df)
+    fcst = nf.predict()
+    # fcst: columns include unique_id, ds and model name (often model.__class__.__name__ or alias)
+    # Find the prediction column:
+    pred_col = None
+    for c in fcst.columns:
+        if c.lower() == model_name.lower():
+            pred_col = c
+            break
+    if pred_col is None:
+        # fallback: last column that's not unique_id/ds
+        cand = [c for c in fcst.columns if c not in ("unique_id", "ds")]
+        pred_col = cand[-1] if cand else None
+    if pred_col is None:
+        raise RuntimeError("NeuralForecast returned no prediction column.")
+
+    yhat = fcst[pred_col].to_numpy(dtype="float64")
+    x_fc = _forecast_index(y2, h)
+    return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": model_name, "horizon": h, "input_size": input_size, "max_steps": max_steps}, warnings=warnings)
 
 
 @router.post("/tsa/V_neuralprophet_forecast", response_model=ApiOut)
 def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
-    """
-    NeuralProphet forecast (optional).
-    Requires: neuralprophet (+ torch)
-    """
+    """NeuralProphet forecast (requires neuralprophet)."""
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
+    if len(y2) < 20:
+        raise HTTPException(status_code=400, detail="Need at least 20 non-missing points for NeuralProphet.")
     if len(y2) > int(payload.max_train_points):
-        warnings.append(f"NeuralProphet: using last {int(payload.max_train_points)} points for speed.")
         y2 = y2.iloc[-int(payload.max_train_points):]
-    h = int(max(1, payload.horizon))
+        warnings.append(f"Trimmed series to last {payload.max_train_points} points for NeuralProphet training.")
+    h = int(payload.horizon)
+    if h < 1:
+        raise HTTPException(status_code=422, detail="horizon must be >= 1")
 
     try:
-        from neuralprophet import NeuralProphet  # type: ignore
+        from neuralprophet import NeuralProphet
     except Exception:
-        _require_optional("NeuralProphet", "Add `neuralprophet` to requirements.txt (includes torch).")
+        _require_optional("neuralprophet", "Add neuralprophet to requirements.txt and redeploy.")
 
-    # Build df with ds/y
-    try:
-        df = pd.DataFrame({"ds": pd.to_datetime(y2.index), "y": y2.values})
-        m = NeuralProphet(epochs=int(max(5, payload.epochs)))
-        m.fit(df, freq=(infer_freq_safe(y2.index) or "D"), progress="off")
-        future = m.make_future_dataframe(df, periods=h, n_historic_predictions=False)
-        fcst = m.predict(future)
-        # NeuralProphet returns yhat1 column
-        yhat = fcst["yhat1"].values.astype("float64")
-        x_fc = _forecast_index(y2, h)
-        return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "NeuralProphet"}, warnings=warnings)
-    except Exception as e:
-        return ApiOut(ok=False, result={"error": f"NeuralProphet failed: {str(e)}"}, warnings=warnings)
+    # Build df
+    df = pd.DataFrame({"ds": y2.index.to_pydatetime(), "y": y2.values.astype("float64")})
+
+    # Minimal settings for API usage
+    m = NeuralProphet(
+        n_lags=min(max(12, 2*h), max(8, len(y2)//2)),
+        n_forecasts=h,
+        epochs=int(os.getenv("NEURALPROPHET_EPOCHS", str(payload.epochs))),
+        learning_rate=float(os.getenv("NEURALPROPHET_LR", "1e-2")),
+    )
+    m.fit(df, freq=freq if freq else None)
+
+    future = m.make_future_dataframe(df, periods=h, n_historic_predictions=False)
+    forecast = m.predict(future)
+    # forecast columns: yhat1..yhatH
+    col = f"yhat{h}"
+    if col not in forecast.columns:
+        # fallback: pick the last yhat column
+        yhats = [c for c in forecast.columns if c.startswith("yhat")]
+        if not yhats:
+            raise RuntimeError("NeuralProphet returned no yhat columns.")
+        col = yhats[-1]
+    yhat = forecast[col].to_numpy(dtype="float64")
+    x_fc = _forecast_index(y2, h)
+    return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "neuralprophet"}, warnings=warnings)
 
 
 @router.post("/tsa/W_nhits_forecast", response_model=ApiOut)
 def tsa_w_nhits_forecast(payload: DeepForecastIn):
-    """
-    N-HiTS forecast (optional).
-    Recommended lightweight path: StatsForecast (if installed).
-    """
-    y, warnings, freq = _prep_series(payload.series)
-    y2 = y.dropna()
-    if len(y2) > int(payload.max_train_points):
-        warnings.append(f"NHiTS: using last {int(payload.max_train_points)} points for speed.")
-        y2 = y2.iloc[-int(payload.max_train_points):]
-    h = int(max(1, payload.horizon))
-
+    """NHITS forecast via NeuralForecast (requires neuralforecast)."""
     try:
-        # StatsForecast provides NHiTS with good performance
-        from statsforecast import StatsForecast  # type: ignore
-        from statsforecast.models import NHiTS  # type: ignore
+        from neuralforecast.models import NHITS
     except Exception:
-        _require_optional("StatsForecast NHiTS", "Add `statsforecast` to requirements.txt.")
-
-    try:
-        # Build dataframe expected by StatsForecast
-        ds = pd.to_datetime(y2.index)
-        df = pd.DataFrame({"unique_id": "s", "ds": ds, "y": y2.values.astype("float64")})
-        sf = StatsForecast(models=[NHiTS()], freq=(infer_freq_safe(ds) or "D"), n_jobs=1)
-        fcst = sf.forecast(df=df, h=h)
-        col = [c for c in fcst.columns if c not in ("unique_id", "ds")][0]
-        yhat = fcst[col].values.astype("float64")
-        x_fc = [d.isoformat() for d in fcst["ds"].tolist()]
-        return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "NHiTS"}, warnings=warnings)
-    except Exception as e:
-        return ApiOut(ok=False, result={"error": f"NHiTS failed: {str(e)}"}, warnings=warnings)
+        _require_optional("neuralforecast", "Install neuralforecast (includes NHITS) in requirements.txt and redeploy.")
+    return _nf_forecast_univariate(payload, "NHITS", NHITS)
 
 
 @router.post("/tsa/X_patchtst_or_tide_forecast", response_model=ApiOut)
 def tsa_x_patchtst_or_tide_forecast(payload: DeepForecastIn):
-    """
-    PatchTST / TiDE (optional).
-    Practical implementation path: `darts` library (if installed).
-    """
-    y, warnings, freq = _prep_series(payload.series)
-    y2 = y.dropna()
-    if len(y2) > int(payload.max_train_points):
-        warnings.append(f"PatchTST/TiDE: using last {int(payload.max_train_points)} points for speed.")
-        y2 = y2.iloc[-int(payload.max_train_points):]
-    h = int(max(1, payload.horizon))
-
-    model_name = (payload.model_name or "tide").lower().strip()
-    if model_name not in ("patchtst", "tide"):
-        model_name = "tide"
-
+    """PatchTST or TiDE forecast via NeuralForecast (requires neuralforecast)."""
+    name = (payload.model_name or "patchtst").lower().strip()
     try:
-        from darts import TimeSeries  # type: ignore
-        from darts.models import PatchTSTModel, TiDEModel  # type: ignore
+        from neuralforecast import NeuralForecast  # noqa: F401
+        from neuralforecast.models import PatchTST, TiDE
     except Exception:
-        _require_optional("darts (PatchTST/TiDE)", "Add `u8darts[torch]` to requirements.txt (includes torch).")
+        _require_optional("neuralforecast", "Install neuralforecast in requirements.txt and redeploy.")
 
-    try:
-        ts = TimeSeries.from_times_and_values(pd.to_datetime(y2.index), y2.values.astype("float64"))
-        if model_name == "patchtst":
-            model = PatchTSTModel(input_chunk_length=min(96, max(12, len(y2)//4)), output_chunk_length=h, n_epochs=int(max(5, payload.epochs)))
-        else:
-            model = TiDEModel(input_chunk_length=min(96, max(12, len(y2)//4)), output_chunk_length=h, n_epochs=int(max(5, payload.epochs)))
-        model.fit(ts, verbose=False)
-        pred = model.predict(h)
-        yhat = pred.values().squeeze().astype("float64")
-        x_fc = _forecast_index(y2, h)
-        return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": model_name}, warnings=warnings)
-    except Exception as e:
-        return ApiOut(ok=False, result={"error": f"{model_name} failed: {str(e)}"}, warnings=warnings)
+    if name == "tide":
+        return _nf_forecast_univariate(payload, "TiDE", TiDE)
+    else:
+        return _nf_forecast_univariate(payload, "PatchTST", PatchTST)
 
 
 @router.post("/tsa/Y_transformer_family_forecast", response_model=ApiOut)
 def tsa_y_transformer_family_forecast(payload: DeepForecastIn):
-    """
-    Transformer-family placeholders: TimesNet / iTransformer / SOFTS.
-    Implementation depends on which library you choose (many are research code).
-    This endpoint is here so your frontend can already "see" the method, and you can wire it later.
+    """TimesNet / iTransformer / SOFTS via NeuralForecast (requires neuralforecast)."""
+    name = (payload.model_name or "timesnet").lower().strip()
+    try:
+        from neuralforecast import NeuralForecast  # noqa: F401
+        from neuralforecast.models import TimesNet, iTransformer, SOFTS
+    except Exception:
+        _require_optional("neuralforecast", "Install neuralforecast in requirements.txt and redeploy.")
 
-    Recommended practical path (production): use `darts` TransformerModel or `gluonts`/`pytorch-forecasting`.
-    """
-    name = (payload.model_name or "itransformer").lower().strip()
-    if name not in ("timesnet", "itransformer", "softs"):
-        name = "itransformer"
+    if name == "itransformer":
+        # iTransformer expects n_series; we'll run it in univariate mode with n_series=1
+        def ctor(**kwargs):
+            return iTransformer(n_series=1, **kwargs)
+        return _nf_forecast_univariate(payload, "iTransformer", ctor)
 
-    _require_optional(
-        f"{name}",
-        "This model family is not bundled by default. Choose a library (e.g., u8darts[torch] TransformerModel, or your preferred implementation), "
-        "add it to requirements.txt, then implement training/inference here."
-    )
+    if name == "softs":
+        def ctor(**kwargs):
+            return SOFTS(n_series=1, **kwargs)
+        return _nf_forecast_univariate(payload, "SOFTS", ctor)
+
+    # default TimesNet (univariate)
+    return _nf_forecast_univariate(payload, "TimesNet", TimesNet)

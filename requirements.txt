@@ -8,3 +8,8 @@ statsmodels==0.14.4
 python-dateutil==2.9.0.post0
 PyWavelets>=1.5.0
 python-jose[cryptography]
+ruptures
+statsforecast
+neuralprophet
+u8darts[torch]
+python-jose[cryptography]

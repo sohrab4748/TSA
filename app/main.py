@@ -12,10 +12,17 @@ def routes():
         if hasattr(r, "methods"):
             out.append({"path": r.path, "methods": sorted(list(r.methods))})
     return sorted(out, key=lambda x: x["path"])
-
+ALLOWED_ORIGINS = [
+    "https://tsa.agrimetsoft.com",
+    # Local dev (optional)
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://tsa.agrimetsoft.com"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -2406,12 +2406,14 @@ def tsa_u_conformal_forecast(payload: ConformalIn):
 # Optional "Deep/Modern" forecasting methods (placeholders unless dependencies are installed)
 # ---------------------------
 
+
 class DeepForecastIn(BaseModel):
     series: SeriesIn
     horizon: int = 30
     seasonal_period: Optional[int] = None
-    max_train_points: int = 2000
-    epochs: int = 30
+    max_train_points: int = 1000
+    epochs: int = 5
+    max_steps: Optional[int] = None  # caps training steps for NeuralForecast models
     model_name: Optional[str] = None  # used for transformer-family chooser
 
 
@@ -2431,6 +2433,51 @@ def _infer_nf_freq(dt_index: pd.DatetimeIndex) -> str:
     # Use the base alias (e.g., 'D', 'H', 'M', 'MS', 'W-SUN', 'QS-DEC'...)
     # NeuralForecast uses pandas offsets; we'll pass the inferred alias directly when possible.
     return f
+# In-memory cache to avoid retraining deep models when the same request repeats.
+# Note: Render instances can restart; this cache is best-effort per-process.
+import hashlib
+_DEEP_CACHE: Dict[str, Any] = {}
+_DEEP_CACHE_TTL_SECONDS = int(os.getenv("DEEP_CACHE_TTL_SECONDS", "3600"))
+
+
+def _deep_cache_key(model_name: str, y2: pd.Series, h: int, input_size: int, max_steps: int, extra: str = "") -> str:
+    hsh = hashlib.sha1()
+    # values
+    hsh.update(np.asarray(y2.values, dtype=np.float64).tobytes())
+    # index bounds + length (stable-ish)
+    hsh.update(str(y2.index[0]).encode('utf-8'))
+    hsh.update(str(y2.index[-1]).encode('utf-8'))
+    hsh.update(str(len(y2)).encode('utf-8'))
+    hsh.update(str(h).encode('utf-8'))
+    hsh.update(str(input_size).encode('utf-8'))
+    hsh.update(str(max_steps).encode('utf-8'))
+    hsh.update(model_name.encode('utf-8'))
+    if extra:
+        hsh.update(extra.encode('utf-8'))
+    return hsh.hexdigest()
+
+
+def _deep_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    try:
+        item = _DEEP_CACHE.get(key)
+        if not item:
+            return None
+        ts = float(item.get('ts', 0))
+        if (time.time() - ts) > _DEEP_CACHE_TTL_SECONDS:
+            _DEEP_CACHE.pop(key, None)
+            return None
+        return item.get('value')
+    except Exception:
+        return None
+
+
+def _deep_cache_set(key: str, value: Dict[str, Any]) -> None:
+    try:
+        _DEEP_CACHE[key] = {'ts': time.time(), 'value': value}
+    except Exception:
+        pass
+
+
 
 
 def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor):
@@ -2451,11 +2498,29 @@ def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor
     # A simple robust choice: at least 24, or 2*h, but not more than ~half the data.
     input_size = max(24, 2 * h)
     input_size = min(input_size, max(8, len(y2) // 2))
+    input_size = min(input_size, int(os.getenv("DEEP_MAX_INPUT_SIZE", "96")))
     # training steps (keep it small for API usage)
-    max_steps = int(os.getenv("DEEP_MAX_STEPS", str(max(100, min(1000, payload.epochs * 50)))))
+    if payload.max_steps is not None:
+        max_steps = int(payload.max_steps)
+    else:
+        env_steps = os.getenv("DEEP_MAX_STEPS", "").strip()
+        if env_steps:
+            max_steps = int(env_steps)
+        else:
+            # Default: keep training very small for synchronous API usage
+            max_steps = int(max(20, min(200, int(payload.epochs or 5) * 20)))
+    # Hard safety cap
+    max_steps = int(max(10, min(max_steps, 300)))
     # build df in NeuralForecast format
     df = pd.DataFrame({"unique_id": "ts", "ds": y2.index.to_pydatetime(), "y": y2.values.astype("float64")})
     nf_freq = _infer_nf_freq(pd.DatetimeIndex(df["ds"]))
+
+    # cache key (best-effort)
+    cache_key = _deep_cache_key(model_name, y2, h, input_size, max_steps)
+    cached = _deep_cache_get(cache_key)
+    if cached is not None:
+        warnings.append("Deep model result served from cache (no retraining).")
+        return ApiOut(ok=True, result=cached, warnings=warnings)
 
     try:
         from neuralforecast import NeuralForecast
@@ -2488,7 +2553,9 @@ def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor
 
     yhat = fcst[pred_col].to_numpy(dtype="float64")
     x_fc = _forecast_index(y2, h)
-    return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": model_name, "horizon": h, "input_size": input_size, "max_steps": max_steps}, warnings=warnings)
+    out = {"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": model_name, "horizon": h, "input_size": input_size, "max_steps": max_steps}
+    _deep_cache_set(cache_key, out)
+    return ApiOut(ok=True, result=out, warnings=warnings)
 
 
 @router.post("/tsa/V_neuralprophet_forecast", response_model=ApiOut)
@@ -2513,6 +2580,12 @@ def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
     # Build df
     df = pd.DataFrame({"ds": y2.index.to_pydatetime(), "y": y2.values.astype("float64")})
 
+    cache_key = _deep_cache_key('neuralprophet', y2, h, input_size=min(max(12, 2*h), max(8, len(y2)//2)), max_steps=int(os.getenv('NEURALPROPHET_EPOCHS', str(payload.epochs))))
+    cached = _deep_cache_get(cache_key)
+    if cached is not None:
+        warnings.append("NeuralProphet result served from cache (no retraining).")
+        return ApiOut(ok=True, result=cached, warnings=warnings)
+
     # Minimal settings for API usage
     m = NeuralProphet(
         n_lags=min(max(12, 2*h), max(8, len(y2)//2)),
@@ -2534,7 +2607,9 @@ def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
         col = yhats[-1]
     yhat = forecast[col].to_numpy(dtype="float64")
     x_fc = _forecast_index(y2, h)
-    return ApiOut(ok=True, result={"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "neuralprophet"}, warnings=warnings)
+    out = {"forecast": {"x": x_fc, "y": _as_float_list(yhat)}, "model": "neuralprophet"}
+    _deep_cache_set(cache_key, out)
+    return ApiOut(ok=True, result=out, warnings=warnings)
 
 
 @router.post("/tsa/W_nhits_forecast", response_model=ApiOut)

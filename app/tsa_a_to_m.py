@@ -195,7 +195,6 @@ def account_me(
                 "plan": plan,
             },
         }
-    }
 
 _PAID_EMAILS = {
     e.strip().lower()

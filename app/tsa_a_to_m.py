@@ -145,6 +145,19 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
 
 from typing import Optional
 from fastapi.security import HTTPAuthorizationCredentials
+from fastapi import APIRouter, Request
+
+router = APIRouter()
+
+@router.post("/billing/fastspring/webhook")
+async def fastspring_webhook(request: Request):
+    payload = await request.json()
+
+    # Step 1: log and acknowledge
+    # (Render logs will show it)
+    print("FASTSPRING_WEBHOOK:", payload)
+
+    return {"ok": True}
 
 @router.get("/account/me")
 def account_me(

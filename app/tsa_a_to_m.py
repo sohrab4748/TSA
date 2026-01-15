@@ -185,14 +185,16 @@ def account_me(
         except Exception:
             pass
 
-    return {
-        "ok": True,
-        "user": {
-            "sub": user_claims.get("sub"),
-            "email": email,
-            "email_verified": email_verified,
-            "plan": get_plan(email) or "free"
-        },
+        plan = (get_plan(email) or "free") if email else "free"
+        return {
+            "ok": True,
+            "user": {
+                "sub": user_claims.get("sub"),
+                "email": email,
+                "email_verified": email_verified,
+                "plan": plan,
+            },
+        }
     }
 
 _PAID_EMAILS = {
@@ -203,7 +205,7 @@ _PAID_EMAILS = {
 
 
 def require_pro(email: str | None):
-    "plan": get_plan(email) or "free"
+    plan = (get_plan(email) or "free") if email else "free"
     if plan != "pro":
         raise HTTPException(
             status_code=403,

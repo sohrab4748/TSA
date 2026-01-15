@@ -191,7 +191,7 @@ def account_me(
             "sub": user_claims.get("sub"),
             "email": email,
             "email_verified": email_verified,
-            "plan": get_user_plan(email),
+            "plan": get_plan(email) or "free"
         },
     }
 
@@ -203,7 +203,7 @@ _PAID_EMAILS = {
 
 
 def require_pro(email: str | None):
-    plan = get_user_plan(email)
+    "plan": get_plan(email) or "free"
     if plan != "pro":
         raise HTTPException(
             status_code=403,

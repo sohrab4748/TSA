@@ -27,6 +27,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+from app.fastspring_webhook import router as fastspring_router
+app.include_router(fastspring_router)
 
 app.include_router(tsa_router, prefix="/analysis", tags=["tsa"])
 

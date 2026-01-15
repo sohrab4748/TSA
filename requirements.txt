@@ -13,3 +13,4 @@ statsforecast
 neuralprophet
 u8darts[torch]
 python-jose[cryptography]
+neuralforecast

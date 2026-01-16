@@ -2,9 +2,10 @@
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Body, Query, HTTPException, Depends
+from fastapi import APIRouter, Body, Query, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
+import json
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -143,34 +144,153 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token.")
 
+
+
+# ---------------------------
+# Account & Entitlements (no disk)
+# ---------------------------
 from typing import Optional
 from fastapi.security import HTTPAuthorizationCredentials
-from fastapi import APIRouter, Request
 
-router = APIRouter()
+# Back-compat: manual allowlist (comma-separated emails)
+_PAID_EMAILS = {
+    e.strip().lower()
+    for e in (os.getenv("PAID_EMAILS", "")).split(",")
+    if e.strip()
+}
 
-@router.post("/billing/fastspring/webhook")
-async def fastspring_webhook(request: Request):
-    payload = await request.json()
+# Optional: Auth0 Management API (preferred persistence; no Render Disk required)
+# Set these Render env vars to enable:
+#   AUTH0_MGMT_CLIENT_ID
+#   AUTH0_MGMT_CLIENT_SECRET
+#   (optional) AUTH0_MGMT_AUDIENCE (defaults to https://<AUTH0_DOMAIN>/api/v2/)
+#   (optional) AUTH0_PLAN_CLAIM (defaults to https://tsa.agrimetsoft.com/plan)
+_AUTH0_PLAN_CLAIM = os.getenv("AUTH0_PLAN_CLAIM", "https://tsa.agrimetsoft.com/plan")
 
-    # Step 1: log and acknowledge
-    # (Render logs will show it)
-    print("FASTSPRING_WEBHOOK:", payload)
+_mgmt_cache = {"token": None, "exp": 0}
 
-    return {"ok": True}
+def _auth0_mgmt_enabled() -> bool:
+    return bool(os.getenv("AUTH0_MGMT_CLIENT_ID") and os.getenv("AUTH0_MGMT_CLIENT_SECRET") and _AUTH0_DOMAIN)
 
-@router.get("/account/me")
-def account_me(
-    user_claims=Depends(require_auth),
-    creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer),
-):
-    # token used to call /userinfo
-    token = creds.credentials if creds else None
+def _auth0_mgmt_get_token() -> str:
+    # Cached client_credentials token
+    now = int(time.time())
+    if _mgmt_cache.get("token") and now < int(_mgmt_cache.get("exp", 0)) - 30:
+        return _mgmt_cache["token"]
 
+    client_id = os.getenv("AUTH0_MGMT_CLIENT_ID")
+    client_secret = os.getenv("AUTH0_MGMT_CLIENT_SECRET")
+    audience = os.getenv("AUTH0_MGMT_AUDIENCE", f"https://{_AUTH0_DOMAIN}/api/v2/")
+    if not (client_id and client_secret and _AUTH0_DOMAIN):
+        raise RuntimeError("Auth0 Management API is not configured.")
+
+    url = f"https://{_AUTH0_DOMAIN}/oauth/token"
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "audience": audience,
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    token = data.get("access_token")
+    expires_in = int(data.get("expires_in", 3600))
+    if not token:
+        raise RuntimeError("Auth0 Management token missing in response.")
+    _mgmt_cache["token"] = token
+    _mgmt_cache["exp"] = now + expires_in
+    return token
+
+def _auth0_mgmt_request(method: str, path: str, body: dict | None = None, query: str | None = None) -> dict:
+    tok = _auth0_mgmt_get_token()
+    url = f"https://{_AUTH0_DOMAIN}/api/v2{path}"
+    if query:
+        url = url + ("?" + query)
+    headers = {"Authorization": f"Bearer {tok}"}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read().decode("utf-8")
+    return json.loads(raw) if raw else {}
+
+def _auth0_get_user_app_plan(user_id: str) -> str | None:
+    if not _auth0_mgmt_enabled() or not user_id:
+        return None
+    try:
+        u = _auth0_mgmt_request("GET", f"/users/{urllib.parse.quote(user_id, safe='')}" , query="fields=app_metadata&include_fields=true")
+        appm = (u or {}).get("app_metadata") or {}
+        plan = appm.get("plan")
+        return str(plan).lower() if plan else None
+    except Exception:
+        return None
+
+def _auth0_find_user_id_by_email(email: str) -> str | None:
+    if not _auth0_mgmt_enabled() or not email:
+        return None
+    try:
+        # users-by-email requires 'read:users'
+        q = "email=" + urllib.parse.quote(email)
+        users = _auth0_mgmt_request("GET", "/users-by-email", query=q)
+        if isinstance(users, list) and users:
+            return users[0].get("user_id")
+        return None
+    except Exception:
+        return None
+
+def _auth0_set_user_plan(email: str, plan: str) -> bool:
+    if not _auth0_mgmt_enabled() or not email:
+        return False
+    user_id = _auth0_find_user_id_by_email(email)
+    if not user_id:
+        return False
+    try:
+        _auth0_mgmt_request("PATCH", f"/users/{urllib.parse.quote(user_id, safe='')}", body={"app_metadata": {"plan": plan}})
+        return True
+    except Exception:
+        return False
+
+
+def get_user_plan(email: str | None, user_id: str | None = None, claims: dict | None = None) -> str:
+    # 1) If an Auth0 Action injected a custom claim, prefer it (fastest)
+    if claims:
+        plan_claim = claims.get(_AUTH0_PLAN_CLAIM) or claims.get("plan")
+        if isinstance(plan_claim, str) and plan_claim.strip():
+            return plan_claim.strip().lower()
+
+    # 2) Back-compat allowlist
+    if email and email.strip().lower() in _PAID_EMAILS:
+        return "pro"
+
+    # 3) Auth0 app_metadata (persistent)
+    if user_id:
+        p = _auth0_get_user_app_plan(user_id)
+        if p:
+            return p
+
+    return "free"
+
+
+def require_pro(email: str | None, user_id: str | None = None, claims: dict | None = None):
+    plan = get_user_plan(email=email, user_id=user_id, claims=claims)
+    if plan != "pro":
+        raise HTTPException(
+            status_code=403,
+            detail="Upgrade required: this feature is available on the Pro plan.",
+        )
+
+
+def _email_from_claims_or_userinfo(user_claims: dict, token: str | None) -> tuple[str | None, bool | None]:
     email = user_claims.get("email")
     email_verified = user_claims.get("email_verified")
-
-    # If email isn't in the JWT, fetch it from Auth0 /userinfo
     if token and not email:
         try:
             req = urllib.request.Request(
@@ -184,42 +304,117 @@ def account_me(
             email_verified = u.get("email_verified")
         except Exception:
             pass
-
-        plan = (get_plan(email) or "free") if email else "free"
-        return {
-            "ok": True,
-            "user": {
-                "sub": user_claims.get("sub"),
-                "email": email,
-                "email_verified": email_verified,
-                "plan": plan,
-            },
-        }
-
-_PAID_EMAILS = {
-    e.strip().lower()
-    for e in (os.getenv("PAID_EMAILS", "")).split(",")
-    if e.strip()
-}
+    return email, email_verified
 
 
-def require_pro(email: str | None):
-    plan = (get_plan(email) or "free") if email else "free"
-    if plan != "pro":
-        raise HTTPException(
-            status_code=403,
-            detail="Upgrade required: AI Interpretation is available on the Pro plan."
-        )
+@router.get("/account/me")
+def account_me(
+    user_claims=Depends(require_auth),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer),
+):
+    token = creds.credentials if creds else None
+    email, email_verified = _email_from_claims_or_userinfo(user_claims, token)
+    sub = user_claims.get("sub")
 
-def get_user_plan(email: str | None) -> str:
-    if not email:
-        return "free"
-    return "pro" if email.strip().lower() in _PAID_EMAILS else "free"
+    return {
+        "ok": True,
+        "user": {
+            "sub": sub,
+            "email": email,
+            "email_verified": email_verified,
+            "plan": get_user_plan(email=email, user_id=sub, claims=user_claims),
+        },
+    }
+
+
+# FastSpring -> Auth0 plan updater
+# On FastSpring, create a Webhook URL endpoint pointing to:
+#   https://<YOUR_RENDER_DOMAIN>/analysis/billing/fastspring/webhook?token=<YOUR_SECRET>
+# Set Render env:
+#   FASTSPRING_WEBHOOK_TOKEN=<YOUR_SECRET>
+#   TSA_PRO_SKUS=comma-separated product/sku identifiers that mean Pro
+
+@router.post("/billing/fastspring/webhook")
+async def fastspring_webhook(request: Request):
+    # Simple shared-secret (easiest)
+    expected = os.getenv("FASTSPRING_WEBHOOK_TOKEN", "").strip()
+    got = (request.query_params.get("token") or request.headers.get("x-webhook-token") or "").strip()
+    if expected and got != expected:
+        raise HTTPException(status_code=401, detail="Invalid webhook token.")
+
+    payload = await request.json()
+    pro_skus = {s.strip().lower() for s in os.getenv("TSA_PRO_SKUS", "").split(",") if s.strip()}
+
+    updated = []
+    skipped = []
+
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        events = []
+
+    for ev in events:
+        try:
+            ev_type = (ev.get("type") or "").strip()
+            data = ev.get("data") or {}
+            order = data.get("order") or data
+            customer = (order.get("customer") or {}) if isinstance(order, dict) else {}
+            email = (customer.get("email") or "").strip().lower()
+            items = order.get("items") or []
+
+            skus = []
+            if isinstance(items, list):
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    skus.append((it.get("sku") or it.get("product") or "").strip().lower())
+
+            # Decide target plan
+            grant_events = {
+                "order.completed",
+                "subscription.activated",
+                "subscription.charge.completed",
+                "subscription.updated",
+                "subscription.resumed",
+            }
+            revoke_events = {
+                "subscription.deactivated",
+                "subscription.canceled",
+                "subscription.cancelled",
+            }
+
+            if not email:
+                skipped.append({"reason": "missing_email", "event": ev_type})
+                continue
+
+            target_plan = None
+            if ev_type in revoke_events:
+                target_plan = "free"
+            elif ev_type in grant_events:
+                # If no skus configured, treat any grant event as Pro
+                if not pro_skus:
+                    target_plan = "pro"
+                else:
+                    target_plan = "pro" if any(s in pro_skus for s in skus if s) else "free"
+
+            if not target_plan:
+                skipped.append({"email": email, "event": ev_type, "reason": "ignored_event"})
+                continue
+
+            ok = _auth0_set_user_plan(email, target_plan)
+            if ok:
+                updated.append({"email": email, "plan": target_plan, "event": ev_type})
+            else:
+                skipped.append({"email": email, "plan": target_plan, "event": ev_type, "reason": "auth0_update_failed_or_user_missing"})
+
+        except Exception as ex:
+            skipped.append({"reason": "exception", "error": str(ex)})
+
+    return {"ok": True, "updated": updated, "skipped": skipped}
+
 
 # ---------------------------
 # Helpers
 # ---------------------------
-import json
 
 def _prep_series(series):
     import pandas as pd
@@ -1531,9 +1726,14 @@ def _call_gemini_text(system_instruction: str, user_prompt: str, model: str) -> 
     raise RuntimeError(f"Gemini request failed: {last_err}")
 
 @router.post("/ai/interpret", response_model=ApiOut)
-def ai_interpret(payload: AIInterpretIn = Body(...), user_claims: Dict[str, Any] = Depends(require_auth)):
+def ai_interpret(payload: AIInterpretIn = Body(...), user_claims: Dict[str, Any] = Depends(require_auth), creds: Optional[HTTPAuthorizationCredentials] = Depends(_auth_bearer)):
     # Server-side AI interpretation: build prompt in code, call Gemini, return text.
     try:
+        token = creds.credentials if creds else None
+        # Resolve identity & plan
+        email, email_verified = _email_from_claims_or_userinfo(user_claims, token)
+        if os.getenv("TSA_AI_REQUIRE_PRO", "1").strip().lower() not in ("0", "false", "no", "off"):
+            require_pro(email=email, user_id=user_claims.get("sub"), claims=user_claims)
         y, warnings, freq = _prep_series(payload.series)
         system, user, compact = _build_ai_prompt(payload, y, freq, warnings)
         model = payload.model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"

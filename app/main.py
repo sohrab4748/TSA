@@ -1,36 +1,35 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# The TSA router (your big tsa_a_to_m.py). It already includes the billing webhook.
 from app.tsa_a_to_m import router as tsa_router
-from app.analysis_run import router as run_router
 
-app = FastAPI(title="TSA Dashboard API (A–M)", version="0.1.0")
+app = FastAPI(title="TSA Dashboard API")
 
-@app.get("/routes")
-def routes():
-    out = []
-    for r in app.routes:
-        if hasattr(r, "methods"):
-            out.append({"path": r.path, "methods": sorted(list(r.methods))})
-    return sorted(out, key=lambda x: x["path"])
-ALLOWED_ORIGINS = [
-    "https://tsa.agrimetsoft.com",
-    # Local dev (optional)
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "http://localhost:5500",
-    "http://127.0.0.1:5500",
-]
+# ---- CORS ----
+# Override via env var (comma-separated) if needed.
+# Example: CORS_ALLOW_ORIGINS=https://tsa.agrimetsoft.com,http://localhost:5500
+origins_env = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "https://tsa.agrimetsoft.com,"
+    "http://localhost:5500,http://127.0.0.1:5500,"
+    "http://localhost:8000,http://127.0.0.1:8000",
+)
+allowed_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
-from app.fastspring_webhook import router as fastspring_router
-app.include_router(fastspring_router)
 
-app.include_router(tsa_router, prefix="/analysis", tags=["tsa"])
+# Your routes are already defined under router paths like /analysis/tsa/...
+app.include_router(tsa_router, prefix="/analysis")
+
 
 @app.get("/")
 def root():
@@ -38,8 +37,9 @@ def root():
         "name": "TSA Dashboard API",
         "status": "ok",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
     }
+
 
 @app.get("/health")
 def health():

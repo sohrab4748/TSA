@@ -5,6 +5,21 @@ import pandas as pd
 from fastapi import APIRouter, Body, Query, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
+
+def _read_int(names, default):
+    """Read int env var. `names` may be a string or list/tuple of names (first hit wins)."""
+    if isinstance(names, (str, bytes)):
+        names = [names]
+    for name in names:
+        v = os.getenv(name)
+        if v is None:
+            continue
+        try:
+            return int(str(v).strip())
+        except Exception:
+            continue
+    return default
+
 import json
 from datetime import datetime
 from pydantic import BaseModel, Field

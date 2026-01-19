@@ -2966,7 +2966,7 @@ def tsa_w_nhits_forecast(payload: DeepForecastIn):
             from neuralforecast.models import NHITS
         except Exception:
             _require_optional("neuralforecast", "Install neuralforecast (includes NHITS) in requirements.txt and redeploy.")
-        return _nf_forecast_univariate(payload, "NHITS", NHITS)
+        return _nf_forecast_univariate(p, "NHITS", NHITS)
     
 
     return _deep_run(payload, 'nhits', _impl)
@@ -2981,14 +2981,16 @@ def tsa_x_patchtst_or_tide_forecast(payload: DeepForecastIn):
             from neuralforecast.models import PatchTST, TiDE
         except Exception:
             _require_optional("neuralforecast", "Install neuralforecast in requirements.txt and redeploy.")
-    
-        if name == "tide":
-            return _nf_forecast_univariate(payload, "TiDE", TiDE)
-        else:
-            return _nf_forecast_univariate(payload, "PatchTST", PatchTST)
-    
 
-    return _deep_run(payload, ('tide' if (p.model_name or 'patchtst').lower().strip()=='tide' else 'patchtst'), _impl)
+        # IMPORTANT: use the capped payload `p` (not outer `payload`)
+        if name == "tide":
+            return _nf_forecast_univariate(p, "TiDE", TiDE)
+        else:
+            return _nf_forecast_univariate(p, "PatchTST", PatchTST)
+
+    family = (payload.model_name or 'patchtst').lower().strip()
+    family = 'tide' if family == 'tide' else 'patchtst'
+    return _deep_run(payload, family, _impl)
 
 @router.post("/tsa/Y_transformer_family_forecast", response_model=ApiOut)
 def tsa_y_transformer_family_forecast(payload: DeepForecastIn):
@@ -3005,13 +3007,14 @@ def tsa_y_transformer_family_forecast(payload: DeepForecastIn):
             # iTransformer expects n_series; we'll run it in univariate mode with n_series=1
             def ctor(**kwargs):
                 return iTransformer(n_series=1, **kwargs)
-            return _nf_forecast_univariate(payload, "iTransformer", ctor)
+            return _nf_forecast_univariate(p, "iTransformer", ctor)
     
         if name == "softs":
             def ctor(**kwargs):
                 return SOFTS(n_series=1, **kwargs)
-            return _nf_forecast_univariate(payload, "SOFTS", ctor)
+            return _nf_forecast_univariate(p, "SOFTS", ctor)
     
         # default TimesNet (univariate)
-        return _nf_forecast_univariate(payload, "TimesNet", TimesNet)
-    return _deep_run(payload, (p.model_name or 'timesnet').lower().strip(), _impl)
+        return _nf_forecast_univariate(p, "TimesNet", TimesNet)
+    family = (payload.model_name or 'timesnet').lower().strip()
+    return _deep_run(payload, family, _impl)

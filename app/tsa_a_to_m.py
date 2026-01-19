@@ -2621,6 +2621,37 @@ def tsa_u_conformal_forecast(payload: ConformalIn):
 # ---------------------------
 
 
+
+# Deep/Experimental runtime guards (helpful on low-resource instances like Render Free)
+import threading
+
+_TSA_DEEP_MODE = (os.getenv("TSA_DEEP_MODE", "full") or "full").strip().lower()
+_DEEP_CONCURRENCY = int((os.getenv("DEEP_CONCURRENCY", "1") or "1").strip() or "1")
+_DEEP_SEM = threading.BoundedSemaphore(max(1, _DEEP_CONCURRENCY))
+
+
+def _deep_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name, "")
+        v = v.strip() if isinstance(v, str) else ""
+        return int(v) if v else int(default)
+    except Exception:
+        return int(default)
+
+
+def _deep_guard_or_raise(family: str) -> None:
+    """Guard deep endpoints. Set TSA_DEEP_MODE=off|lite|full.
+
+    - off: disable V/W/X/Y
+    - lite: allow V/W, disable X/Y (transformer-family)
+    - full: allow all
+    """
+    mode = _TSA_DEEP_MODE
+    if mode in ("0", "off", "false", "disabled", "none"):
+        raise HTTPException(status_code=503, detail="Deep/Experimental models are disabled on this server.")
+    if mode in ("lite", "free", "limited") and family in ("X", "Y"):
+        raise HTTPException(status_code=503, detail="Transformer-family deep models are disabled on this server.")
+
 class DeepForecastIn(BaseModel):
     series: SeriesIn
     horizon: int = 30
@@ -2634,68 +2665,6 @@ class DeepForecastIn(BaseModel):
 def _require_optional(dep_name: str, hint: str) -> None:
     """Raise a consistent 501 when an optional dependency isn't installed."""
     raise HTTPException(status_code=501, detail=f"Optional dependency missing for {dep_name}. {hint}")
-
-# ---------------------------
-# Deep/Experimental resource guards (Render free-plan safety)
-# ---------------------------
-import threading
-from contextlib import contextmanager
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.getenv(name, str(default)).strip()
-        return int(v) if v else int(default)
-    except Exception:
-        return int(default)
-
-def _deep_mode() -> str:
-    return (os.getenv('TSA_DEEP_MODE') or os.getenv('DEEP_MODE') or 'lite').strip().lower()
-
-_DEEP_CONCURRENCY = max(1, _env_int('DEEP_CONCURRENCY', 1))
-_DEEP_SEM = threading.Semaphore(_DEEP_CONCURRENCY)
-
-@contextmanager
-def _deep_slot():
-    # Non-blocking: if another deep job is running, fail fast instead of piling up requests.
-    if not _DEEP_SEM.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail='Deep/Experimental analysis is busy on this server. Please try again later or use a Classic method.')
-    try:
-        yield
-    finally:
-        try:
-            _DEEP_SEM.release()
-        except Exception:
-            pass
-
-def _deep_guard(endpoint_id: str) -> None:
-    mode = _deep_mode()
-    if mode in ('off', 'disabled', 'false', '0', 'none'):
-        raise HTTPException(status_code=503, detail='Deep/Experimental models are disabled on this server. Use a Classic method.')
-    if mode == 'lite':
-        # These families are the most likely to exceed Render free-plan limits.
-        if endpoint_id in ('X_patchtst_or_tide_forecast', 'Y_transformer_family_forecast'):
-            raise HTTPException(status_code=503, detail='This Deep/Experimental model family is disabled on this server to avoid Render free-plan limits. Use a Classic method.')
-
-def _deep_caps(h: int, max_train: int, epochs: int, max_steps: int | None):
-    mode = _deep_mode()
-    if mode == 'lite':
-        h_cap = _env_int('DEEP_MAX_HORIZON', 24)
-        train_cap = _env_int('DEEP_MAX_TRAIN', 250)
-        epochs_cap = _env_int('DEEP_MAX_EPOCHS', 5)
-        steps_cap = _env_int('DEEP_MAX_STEPS', 60)
-    else:
-        h_cap = _env_int('DEEP_MAX_HORIZON', 60)
-        train_cap = _env_int('DEEP_MAX_TRAIN', 1000)
-        epochs_cap = _env_int('DEEP_MAX_EPOCHS', 20)
-        steps_cap = _env_int('DEEP_MAX_STEPS', 300)
-    h = max(1, min(int(h), int(h_cap)))
-    max_train = max(20, min(int(max_train), int(train_cap)))
-    epochs = max(1, min(int(epochs), int(epochs_cap)))
-    if max_steps is None:
-        max_steps2 = int(steps_cap)
-    else:
-        max_steps2 = max(10, min(int(max_steps), int(steps_cap)))
-    return h, max_train, epochs, max_steps2
 
 
 def _infer_nf_freq(dt_index: pd.DatetimeIndex) -> str:
@@ -2756,23 +2725,31 @@ def _deep_cache_set(key: str, value: Dict[str, Any]) -> None:
 
 
 
-def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor, endpoint_id: str = ""):
+def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor):
     """Run a NeuralForecast model on a single time series."""
-    endpoint_id = (endpoint_id or '').strip() or model_name
-    _deep_guard(endpoint_id)
-    # Apply plan/resource caps
-    h, max_train_points, epochs, max_steps_cap = _deep_caps(payload.horizon, payload.max_train_points, payload.epochs, payload.max_steps)
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
     if len(y2) < 20:
         raise HTTPException(status_code=400, detail="Need at least 20 non-missing points for deep forecasting models.")
+    # Server-side caps (protect low-resource instances regardless of UI payload)
+    max_train_cap = _deep_env_int("DEEP_MAX_TRAIN", 0) or _deep_env_int("DEEP_LITE_MAX_TRAIN_POINTS", 0)
+    max_train_points = int(payload.max_train_points)
+    if max_train_cap > 0 and max_train_points > max_train_cap:
+        warnings.append(f"Clamped max_train_points to {max_train_cap} by server limit.")
+        max_train_points = int(max_train_cap)
+
+    horizon_cap = _deep_env_int("DEEP_MAX_HORIZON", 0) or _deep_env_int("DEEP_LITE_MAX_HORIZON", 0)
     # limit training length
     if len(y2) > int(max_train_points):
         y2 = y2.iloc[-int(max_train_points):]
         warnings.append(f"Trimmed series to last {max_train_points} points for deep model training.")
-    h = int(h)
+    h = int(payload.horizon)
+    if horizon_cap > 0 and h > int(horizon_cap):
+        warnings.append(f"Clamped horizon to {int(horizon_cap)} by server limit.")
+        h = int(horizon_cap)
     if h < 1:
         raise HTTPException(status_code=422, detail="horizon must be >= 1")
+
 
     # input window (lags)
     # A simple robust choice: at least 24, or 2*h, but not more than ~half the data.
@@ -2791,8 +2768,6 @@ def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor
             max_steps = int(max(20, min(200, int(payload.epochs or 5) * 20)))
     # Hard safety cap
     max_steps = int(max(10, min(max_steps, 300)))
-    # Plan cap
-    max_steps = int(min(max_steps, max_steps_cap))
     # build df in NeuralForecast format
     df = pd.DataFrame({"unique_id": "ts", "ds": y2.index.to_pydatetime(), "y": y2.values.astype("float64")})
     nf_freq = _infer_nf_freq(pd.DatetimeIndex(df["ds"]))
@@ -2809,17 +2784,16 @@ def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor
     except Exception:
         _require_optional("neuralforecast", "Install neuralforecast in requirements.txt and redeploy.")
 
-    with _deep_slot():
-        # create model instance
-        try:
-            model = model_ctor(h=h, input_size=input_size, max_steps=max_steps)
-        except TypeError:
-            # some models use different signature; try without max_steps
-            model = model_ctor(h=h, input_size=input_size)
+    # create model instance
+    try:
+        model = model_ctor(h=h, input_size=input_size, max_steps=max_steps)
+    except TypeError:
+        # some models use different signature; try without max_steps
+        model = model_ctor(h=h, input_size=input_size)
 
-        nf = NeuralForecast(models=[model], freq=nf_freq)
-        nf.fit(df=df)
-        fcst = nf.predict()
+    nf = NeuralForecast(models=[model], freq=nf_freq)
+    nf.fit(df=df)
+    fcst = nf.predict()
     # fcst: columns include unique_id, ds and model name (often model.__class__.__name__ or alias)
     # Find the prediction column:
     pred_col = None
@@ -2844,15 +2818,20 @@ def _nf_forecast_univariate(payload: DeepForecastIn, model_name: str, model_ctor
 @router.post("/tsa/V_neuralprophet_forecast", response_model=ApiOut)
 def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
     """NeuralProphet forecast (requires neuralprophet)."""
-    _deep_guard('V_neuralprophet_forecast')
+    _deep_guard_or_raise("V")
     y, warnings, freq = _prep_series(payload.series)
     y2 = y.dropna()
+    max_train_cap = _deep_env_int("DEEP_MAX_TRAIN", 0) or _deep_env_int("DEEP_LITE_MAX_TRAIN_POINTS", 0)
+    if max_train_cap > 0 and int(payload.max_train_points) > int(max_train_cap):
+        warnings.append(f"Clamped max_train_points to {int(max_train_cap)} by server limit.")
+    max_train_points = min(int(payload.max_train_points), int(max_train_cap)) if max_train_cap > 0 else int(payload.max_train_points)
+
     if len(y2) < 20:
         raise HTTPException(status_code=400, detail="Need at least 20 non-missing points for NeuralProphet.")
     if len(y2) > int(max_train_points):
         y2 = y2.iloc[-int(max_train_points):]
         warnings.append(f"Trimmed series to last {max_train_points} points for NeuralProphet training.")
-    h = int(h)
+    h = int(payload.horizon)
     if h < 1:
         raise HTTPException(status_code=422, detail="horizon must be >= 1")
 
@@ -2871,17 +2850,16 @@ def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
         return ApiOut(ok=True, result=cached, warnings=warnings)
 
     # Minimal settings for API usage
-    with _deep_slot():
-        m = NeuralProphet(
-            n_lags=min(max(12, 2*h), max(8, len(y2)//2)),
-            n_forecasts=h,
-            epochs=int(os.getenv("NEURALPROPHET_EPOCHS", str(epochs))),
-            learning_rate=float(os.getenv("NEURALPROPHET_LR", "1e-2")),
-        )
-        m.fit(df, freq=freq if freq else None)
+    m = NeuralProphet(
+        n_lags=min(max(12, 2*h), max(8, len(y2)//2)),
+        n_forecasts=h,
+        epochs=int(os.getenv("NEURALPROPHET_EPOCHS", str(payload.epochs))),
+        learning_rate=float(os.getenv("NEURALPROPHET_LR", "1e-2")),
+    )
+    m.fit(df, freq=freq if freq else None)
 
-        future = m.make_future_dataframe(df, periods=h, n_historic_predictions=False)
-        forecast = m.predict(future)
+    future = m.make_future_dataframe(df, periods=h, n_historic_predictions=False)
+    forecast = m.predict(future)
     # forecast columns: yhat1..yhatH
     col = f"yhat{h}"
     if col not in forecast.columns:
@@ -2900,18 +2878,18 @@ def tsa_v_neuralprophet_forecast(payload: DeepForecastIn):
 @router.post("/tsa/W_nhits_forecast", response_model=ApiOut)
 def tsa_w_nhits_forecast(payload: DeepForecastIn):
     """NHITS forecast via NeuralForecast (requires neuralforecast)."""
-    _deep_guard('W_nhits_forecast')
+    _deep_guard_or_raise("W")
     try:
         from neuralforecast.models import NHITS
     except Exception:
         _require_optional("neuralforecast", "Install neuralforecast (includes NHITS) in requirements.txt and redeploy.")
-    return _nf_forecast_univariate(payload, "NHITS", NHITS, endpoint_id='W_nhits_forecast')
+    return _nf_forecast_univariate(payload, "NHITS", NHITS)
 
 
 @router.post("/tsa/X_patchtst_or_tide_forecast", response_model=ApiOut)
 def tsa_x_patchtst_or_tide_forecast(payload: DeepForecastIn):
     """PatchTST or TiDE forecast via NeuralForecast (requires neuralforecast)."""
-    _deep_guard('X_patchtst_or_tide_forecast')
+    _deep_guard_or_raise("X")
     name = (payload.model_name or "patchtst").lower().strip()
     try:
         from neuralforecast import NeuralForecast  # noqa: F401
@@ -2920,15 +2898,15 @@ def tsa_x_patchtst_or_tide_forecast(payload: DeepForecastIn):
         _require_optional("neuralforecast", "Install neuralforecast in requirements.txt and redeploy.")
 
     if name == "tide":
-        return _nf_forecast_univariate(payload, "TiDE", TiDE, endpoint_id='X_patchtst_or_tide_forecast')
+        return _nf_forecast_univariate(payload, "TiDE", TiDE)
     else:
-        return _nf_forecast_univariate(payload, "PatchTST", PatchTST, endpoint_id='X_patchtst_or_tide_forecast')
+        return _nf_forecast_univariate(payload, "PatchTST", PatchTST)
 
 
 @router.post("/tsa/Y_transformer_family_forecast", response_model=ApiOut)
 def tsa_y_transformer_family_forecast(payload: DeepForecastIn):
     """TimesNet / iTransformer / SOFTS via NeuralForecast (requires neuralforecast)."""
-    _deep_guard('Y_transformer_family_forecast')
+    _deep_guard_or_raise("Y")
     name = (payload.model_name or "timesnet").lower().strip()
     try:
         from neuralforecast import NeuralForecast  # noqa: F401
@@ -2940,12 +2918,12 @@ def tsa_y_transformer_family_forecast(payload: DeepForecastIn):
         # iTransformer expects n_series; we'll run it in univariate mode with n_series=1
         def ctor(**kwargs):
             return iTransformer(n_series=1, **kwargs)
-        return _nf_forecast_univariate(payload, "iTransformer", ctor, endpoint_id='Y_transformer_family_forecast')
+        return _nf_forecast_univariate(payload, "iTransformer", ctor)
 
     if name == "softs":
         def ctor(**kwargs):
             return SOFTS(n_series=1, **kwargs)
-        return _nf_forecast_univariate(payload, "SOFTS", ctor, endpoint_id='Y_transformer_family_forecast')
+        return _nf_forecast_univariate(payload, "SOFTS", ctor)
 
     # default TimesNet (univariate)
-    return _nf_forecast_univariate(payload, "TimesNet", TimesNet, endpoint_id='Y_transformer_family_forecast')
+    return _nf_forecast_univariate(payload, "TimesNet", TimesNet)
